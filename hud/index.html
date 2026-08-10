@@ -106,6 +106,9 @@
   .core-hit:active ~ .core-txt{transform:translate(-50%,-50%) scale(.9)}
   .core-hit:active ~ .core-btnring{border-color:var(--cy);box-shadow:inset 0 0 60px var(--cy-faint),0 0 30px var(--cy-mid)}
   .core-txt{transition:transform .14s cubic-bezier(.34,1.56,.64,1)}
+  body.listening .core-btnring{border-color:var(--cy);box-shadow:inset 0 0 50px var(--cy-faint),0 0 26px var(--cy-mid);animation:corePulse 1.3s ease-in-out infinite}
+  body.listening .core-mode{color:var(--cy)}
+  @keyframes corePulse{0%,100%{opacity:.75;transform:translate(-50%,-50%) scale(1)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.03)}}
   /* four little tap brackets that appear on hover, framing the core as a button */
   .core-hit:hover ~ .core-brackets{opacity:1}
   .core-brackets{position:absolute;left:50%;top:50%;width:230px;height:230px;transform:translate(-50%,-50%);pointer-events:none;z-index:5;opacity:0;transition:opacity .2s}
@@ -246,6 +249,7 @@
   .pg-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:8px}
   .pg-title{font-family:var(--disp);font-size:46px;font-weight:400;letter-spacing:4px;color:var(--ink);line-height:1}
   .pg-sub{font-size:10px;letter-spacing:4px;color:var(--cy-dim);margin-top:8px}
+  .mocktag{font-size:9px;letter-spacing:2px;color:var(--amber);border:1px solid var(--amber);padding:1px 6px;margin-left:8px;vertical-align:middle;opacity:.85}
   .pg-big{font-family:var(--disp);font-size:120px;font-weight:200;color:#f4ffff;line-height:.9}
   .pg-big small{font-size:24px;color:var(--ink-soft);letter-spacing:2px}
   .back{display:inline-flex;align-items:center;gap:8px;font-size:9px;letter-spacing:3px;color:var(--ink-soft);cursor:pointer;
@@ -399,6 +403,28 @@
   @keyframes coreFlash{0%{opacity:0}25%{opacity:.5}100%{opacity:0}}
   @keyframes pageBig{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
   @media(prefers-reduced-motion:reduce){*{animation-duration:.001s!important}}
+  /* ---- Native app feel: rounder + lighter, scoped to Tauri only. ----
+     GitHub Pages / plain-browser demo is untouched — browsers render the
+     full clip-path/glow version fine; this WKWebView-on-this-Mac combo
+     doesn't, so the native app gets a softer, cheaper equivalent look. */
+  body.native *{box-shadow:none!important;backdrop-filter:none!important}
+  body.native *{transition-timing-function:cubic-bezier(.22,1,.36,1)!important}
+  body.native .mic,body.native .back{clip-path:none!important;border-radius:20px}
+  body.native .tile,body.native .clustertile{clip-path:none!important;border-radius:12px}
+  body.native .proj{clip-path:none!important;border-radius:16px}
+  body.native .sbtn{clip-path:none!important;border-radius:14px}
+  body.native .bootbtn{clip-path:none!important;border-radius:14px}
+  body.native .dl-row,body.native .habit{clip-path:none!important;border-radius:14px}
+  body.native .day{clip-path:none!important;border-radius:8px}
+  body.native .navbtn{clip-path:none!important;border-radius:10px}
+  body.native .tx-frame{clip-path:none!important;border-radius:24px}
+  body.native .vtoast,body.native .demobar,body.native .sb{clip-path:none!important;border-radius:12px}
+  body.native .alertbar{clip-path:none!important;border-radius:16px}
+  /* keep a whisper of glow on key live/active states — small radius, cheap */
+  body.native .day.done{box-shadow:0 0 6px var(--cy-faint)!important}
+  body.native .mic.live .dot{box-shadow:0 0 5px var(--cy)!important}
+  body.native .navbtn.on{box-shadow:0 0 8px var(--cy-faint)!important}
+  body.native .sb.sel{box-shadow:0 0 6px currentColor!important}
 </style>
 </head>
 <body data-state="blue">
@@ -427,8 +453,9 @@
 
   <!-- top bar -->
   <div class="topbar">
-    <div class="brand"><div><div class="name">JARVIS</div><div class="sub">ENERGY MODEL 3.1 · SPINE ONLINE</div></div></div>
+    <div class="brand"><div><div class="name">JARVIS</div><div class="sub" id="spineStatus">ENERGY MODEL 3.1 · DEMO MODE</div></div></div>
     <div class="topright">
+      <button class="mic" id="wakeBtn" style="display:none"><span class="dot"></span><span id="wakeTxt">WAKE OFF</span></button>
       <button class="mic" id="micBtn"><span class="dot"></span><span id="micTxt">VOICE OFF</span></button>
       <div class="clock" id="clock">--:--:--</div>
     </div>
@@ -455,12 +482,12 @@
     <div class="core-btnring"></div>
     <div class="core-brackets"><span class="b1"></span><span class="b2"></span><span class="b3"></span><span class="b4"></span></div>
     <div class="core-txt" id="coreTxt">
-      <div class="core-mode">CURRENT ENERGY</div>
+      <div class="core-mode" id="coreMode">CURRENT ENERGY</div>
       <div class="core-num" id="coreNum">72</div>
       <div class="core-den">/ 100</div>
       <div class="core-tag" id="coreTag">NEXT PEAK · 22:00</div>
     </div>
-    <div class="press-hint">◦ PRESS CORE ◦</div>
+    <div class="press-hint" id="pressHint">◦ PRESS CORE · SPEAK TO JARVIS ◦</div>
 
     <div class="cluster" style="top:104px;left:48px;width:206px">
       <div class="lbl">// VITALS</div><div class="rule"></div>
@@ -476,7 +503,7 @@
 
     <div class="cluster r" style="top:104px;right:48px;width:224px">
       <div class="clustertile" data-nav="planner">
-        <div class="lbl" style="text-align:right">TODAY //</div><div class="rule r"></div>
+        <div class="lbl" style="text-align:right">TODAY // <span class="mocktag">MOCK</span></div><div class="rule r"></div>
         <div class="li"><span class="t">14:00</span><span class="task">Infi review · office</span></div>
         <div class="li now"><span class="t">16:30</span><span class="task">Jarvis build · home</span></div>
         <div class="li"><span class="t">18:00</span><span class="task">Run · 5K target</span></div>
@@ -488,7 +515,7 @@
 
     <div class="cluster r" style="bottom:150px;right:48px;width:224px">
       <div class="clustertile" data-detail="radar">
-        <div class="lbl" style="text-align:right">DEADLINE RADAR //</div><div class="rule r"></div>
+        <div class="lbl" style="text-align:right">DEADLINE RADAR // <span class="mocktag">MOCK</span></div><div class="rule r"></div>
         <div class="dl"><b class="mid">4d</b><span>Intro CS exam</span></div>
         <div class="dl"><b>9d</b><span>Yahadut exam</span></div>
         <div class="dl"><b class="soon">now</b><span>Notion token</span></div>
@@ -512,7 +539,7 @@
         <button class="mic pressable" id="focusStart">START</button>
         <button class="mic pressable" id="focusReset">RESET</button>
       </div>
-      <div class="pg-sub" style="margin-top:30px">ENERGY <span id="focusEnergy" style="color:var(--cy)">72</span> · CEILING 3.5H · EVERYTHING ELSE MUTED</div>
+      <div class="pg-sub" style="margin-top:30px">ENERGY <span id="focusEnergy" style="color:var(--cy)">72</span> · CEILING 3.5H · EVERYTHING ELSE MUTED <span class="mocktag">MOCK</span></div>
     </div>
   </div>
 
@@ -520,7 +547,7 @@
   <div class="page" id="page-planner">
     <div class="pg-inner">
       <div class="pg-head">
-        <div><div class="pg-title">PLANNER</div><div class="pg-sub">WED 29 JUL · 5 BLOCKS · 30% BUFFER</div></div>
+        <div><div class="pg-title">PLANNER</div><div class="pg-sub">WED 29 JUL · 5 BLOCKS · 30% BUFFER <span class="mocktag">MOCK</span></div></div>
         <div class="pg-big" style="font-size:60px">3.5<small>H LEFT</small></div>
       </div>
       <div class="rule"></div>
@@ -532,7 +559,7 @@
   <div class="page" id="page-habits">
     <div class="pg-inner">
       <div class="pg-head">
-        <div><div class="pg-title">HABITS</div><div class="pg-sub" id="habitSub">MOCK DATA · NOTION SYNC PENDING</div></div>
+        <div><div class="pg-title">HABITS</div><div class="pg-sub" id="habitSub">MOCK DATA · SPINE OFFLINE</div></div>
         <div class="pg-big" style="font-size:60px" id="habitPct">—</div>
       </div>
       <div class="rule"></div>
@@ -544,7 +571,7 @@
   <div class="page" id="page-projects">
     <div class="pg-inner">
       <div class="pg-head">
-        <div><div class="pg-title">PROJECTS</div><div class="pg-sub">NOTION · ONE HOME FOR EVERYTHING</div></div>
+        <div><div class="pg-title">PROJECTS</div><div class="pg-sub">NOTION · ONE HOME FOR EVERYTHING <span class="mocktag">MOCK</span></div></div>
         <div class="pg-big" style="font-size:60px" id="projCount">—</div>
       </div>
       <div class="rule"></div>
@@ -556,7 +583,7 @@
   <div class="page" id="page-comms">
     <div class="pg-inner">
       <div class="pg-head">
-        <div><div class="pg-title">COMMS</div><div class="pg-sub" id="commsSub">JARVIS VOICE · TAP TO TRANSMIT</div></div>
+        <div><div class="pg-title">COMMS</div><div class="pg-sub" id="commsSub">JARVIS VOICE · TAP TO TRANSMIT <span class="mocktag">MOCK</span></div></div>
         <button class="bootbtn pressable" id="bootBtn">
           <span class="bootbtn-glow"></span>
           <span class="bootbtn-txt">◉ SYSTEMS ONLINE</span>
@@ -594,9 +621,9 @@
   <div class="scrim" id="scrim"></div>
   <div class="tx" id="tx"><div class="tx-frame">
     <span class="edge"></span><span class="ret rt"></span><span class="ret rb"></span>
-    <div class="tx-eyebrow"><span class="pip"></span>JULIE · INCOMING<span class="pip"></span></div>
+    <div class="tx-eyebrow"><span class="pip"></span><span id="txEyebrow">JULIE · INCOMING</span><span class="pip"></span></div>
     <div class="tx-quote" id="txQuote"></div>
-    <div class="tx-sign">— FOR YOU, RIGHT NOW</div>
+    <div class="tx-sign" id="txSign">— FOR YOU, RIGHT NOW</div>
     <div class="tx-dismiss">◦ PRESS TO DISMISS ◦</div>
   </div></div>
 
@@ -618,10 +645,14 @@
     <button class="sb pressable" data-s="gray">Gray</button>
   </div>
 
-  <div class="foot"><b>DEMO</b> · PRESS THE CORE · TAP ANY PANEL TO EXPAND · SAY "JARVIS, OPEN FOCUS" · MOCK DATA</div>
+  <div class="foot" id="foot"><b>DEMO</b> · PRESS THE CORE · TAP ANY PANEL TO EXPAND · SAY "JARVIS, OPEN FOCUS" · MOCK DATA</div>
 </div>
 
 <script>
+  const NATIVE=!!(window.__TAURI__&&window.__TAURI__.core);
+  if(NATIVE){document.body.classList.add('native');}
+  // Anything from the DB or the model gets escaped before it touches innerHTML.
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const C=600,M=400,P2=Math.PI*2;
   const pt=(cx,cy,r,a)=>[cx+Math.cos(a)*r,cy+Math.sin(a)*r];
   const arc=(cx,cy,r,a0,a1)=>{const [x0,y0]=pt(cx,cy,r,a0),[x1,y1]=pt(cx,cy,r,a1);const large=(a1-a0)%P2>Math.PI?1:0;return `M${x0.toFixed(1)} ${y0.toFixed(1)} A${r} ${r} 0 ${large} 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;};
@@ -685,8 +716,9 @@
   ];
   document.getElementById('timeline').innerHTML=BLOCKS.map(b=>`<div class="block ${b.cls}"><div class="bt">${b.t}</div><div class="bbar"></div><div><div class="btitle">${b.title}</div><div class="bmeta">${b.meta}</div></div></div>`).join('');
 
-  // ---- habits data (mock; Notion-wired later) ----
+  // ---- habits data (mock by default; replaced with live spine data in Tauri, see bottom of file) ----
   const DAYS=['M','T','W','T','F','S','S'];
+  let liveHabits=false, habitWeekDates=null;
   const HABITS=[
     {name:'Run',streak:'4 DAY STREAK',week:[1,1,1,0,1,0,0]},
     {name:'Study ≥2h',streak:'11 DAY STREAK',week:[1,1,1,1,1,1,0]},
@@ -696,10 +728,14 @@
     {name:'No phone in bed',streak:'3 DAY STREAK',week:[0,0,1,1,1,0,0]}
   ];
   function renderHabits(){
-    document.getElementById('habitGrid').innerHTML=HABITS.map((h,hi)=>`<div class="habit"><div class="hname">${h.name}</div><div class="hstreak">${h.streak}</div><div class="week">${h.week.map((d,di)=>`<div class="day ${d?'done':''}" data-h="${hi}" data-d="${di}">${DAYS[di]}</div>`).join('')}</div></div>`).join('');
+    document.getElementById('habitGrid').innerHTML=HABITS.map((h,hi)=>`<div class="habit"><div class="hname">${esc(h.name)}</div><div class="hstreak">${esc(h.streak)}</div><div class="week">${h.week.map((d,di)=>`<div class="day ${d?'done':''}" data-h="${hi}" data-d="${di}">${DAYS[di]}</div>`).join('')}</div></div>`).join('');
     let done=0,tot=0;HABITS.forEach(h=>h.week.forEach(d=>{tot++;if(d)done++;}));
     document.getElementById('habitPct').textContent=Math.round(done/tot*100)+'%';
-    document.querySelectorAll('.day').forEach(d=>d.addEventListener('click',function(){const hi=+this.dataset.h,di=+this.dataset.d;HABITS[hi].week[di]=HABITS[hi].week[di]?0:1;renderHabits();}));
+    document.querySelectorAll('.day').forEach(d=>d.addEventListener('click',function(){
+      const hi=+this.dataset.h,di=+this.dataset.d;
+      if(liveHabits){toggleHabitDay(hi,di);return;}
+      HABITS[hi].week[di]=HABITS[hi].week[di]?0:1;renderHabits();
+    }));
   }
   renderHabits();
 
@@ -748,6 +784,15 @@
   }
   if(synth){pickVoice();synth.onvoiceschanged=pickVoice;}
   function speak(text,{rate=0.94,pitch=0.82,onstart,onend}={}){
+    // In the desktop app, use the system voice — WKWebView's speechSynthesis is
+    // unreliable when packaged, and macOS ships a better British voice.
+    if(NATIVE){
+      onstart&&onstart();
+      window.__TAURI__.core.invoke('speak_native',{text})
+        .catch(e=>console.error('speak_native failed',e))
+        .finally(()=>{onend&&onend();});
+      return null;
+    }
     if(!synth){onend&&onend();return null;}
     synth.cancel();
     const u=new SpeechSynthesisUtterance(text);
@@ -986,8 +1031,20 @@
   function fireShock(){flash.style.animation='none';void flash.offsetWidth;flash.style.animation='coreFlash .6s ease';[0,130].forEach(delay=>setTimeout(()=>{const ring=document.createElementNS("http://www.w3.org/2000/svg","circle");ring.setAttribute('cx',C);ring.setAttribute('cy',M);ring.setAttribute('r',66);ring.setAttribute('fill','none');ring.setAttribute('stroke','var(--cy)');ring.setAttribute('stroke-width','2');ring.style.transformOrigin=`${C}px ${M}px`;ring.style.animation='shock 1s ease-out forwards';shockLayer.appendChild(ring);setTimeout(()=>ring.remove(),1050);},delay));}
   function showLine(){if(busy||current!=='dashboard')return;busy=true;fireShock();let i;do{i=Math.floor(Math.random()*LINES.length);}while(i===lastIdx&&LINES.length>1);lastIdx=i;const words=LINES[i].split(' ');qEl.innerHTML=words.map((w,k)=>`<span class="w" style="animation-delay:${(0.4+k*0.065).toFixed(2)}s">${w}</span>`).join(' ');setTimeout(()=>{scrim.classList.add('show');tx.classList.remove('out');tx.classList.add('show');},280);const readMs=2800+words.length*155;clearTimeout(hideTimer);hideTimer=setTimeout(hideLine,readMs+280);}
   function hideLine(){tx.classList.add('out');scrim.classList.remove('show');setTimeout(()=>{tx.classList.remove('show','out');busy=false;},800);}
+  function showTransmission(text,eyebrow,sign){
+    if(busy)return;
+    busy=true;fireShock();
+    const words=text.split(' ');
+    qEl.innerHTML=words.map((w,k)=>`<span class="w" style="animation-delay:${(0.4+k*0.05).toFixed(2)}s">${esc(w)}</span>`).join(' ');
+    document.getElementById('txEyebrow').textContent=eyebrow||'JULIE · INCOMING';
+    document.getElementById('txSign').textContent=sign||'— FOR YOU, RIGHT NOW';
+    setTimeout(()=>{scrim.classList.add('show');tx.classList.remove('out');tx.classList.add('show');},280);
+    const readMs=2800+words.length*155;
+    clearTimeout(hideTimer);
+    hideTimer=setTimeout(hideLine,Math.max(readMs,4000)+280);
+  }
   coreHit.style.position='absolute';coreHit.style.overflow='visible';
-  coreHit.addEventListener('click',showLine);
+  coreHit.addEventListener('click',()=>toggleListening());
   tx.addEventListener('click',()=>{if(busy){clearTimeout(hideTimer);hideLine();}});
 
   // ---- voice ----
@@ -996,26 +1053,164 @@
   const micBtn=document.getElementById('micBtn'),micTxt=document.getElementById('micTxt');
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   let rec=null,listening=false;
-  function handleCommand(text){
-    text=text.toLowerCase();
-    const map=[['focus','focus'],['plan','planner'],['project','projects'],['habit','habits'],['comm','comms'],['soundboard','comms'],['dashboard','dashboard'],['home','dashboard'],['main','dashboard']];
-    if(/wake up|daddy|power on|boot/i.test(text)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');return;}
-    for(const [kw,pg] of map){if(text.includes(kw)){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}}
-    if(text.includes('quote')||text.includes('julie')||text.includes('motivat')){go('dashboard');showLine();toast('▸ JULIE');return;}
-    toast('✕ NOT RECOGNIZED: "'+text+'"');
+  const coreModeEl=document.getElementById('coreMode'),coreTagEl=document.getElementById('coreTag');
+  let coreIdle={mode:coreModeEl.textContent,tag:coreTagEl.textContent};
+  function restoreCoreIdle(){coreModeEl.textContent=coreIdle.mode;coreTagEl.textContent=coreIdle.tag;}
+  function setCore(mode,tag){coreModeEl.textContent=mode;coreTagEl.textContent=tag;}
+  function setListeningUI(on){
+    listening=on;
+    micBtn.classList.toggle('live',on);
+    micTxt.textContent=on?'LISTENING':'VOICE OFF';
+    document.body.classList.toggle('listening',on);
   }
-  if(SR){
-    micBtn.addEventListener('click',()=>{
-      if(listening){rec.stop();return;}
-      rec=new SR();rec.continuous=true;rec.interimResults=false;rec.lang='en-US';
-      rec.onstart=()=>{listening=true;micBtn.classList.add('live');micTxt.textContent='LISTENING';toast('▸ VOICE ONLINE · SAY "JARVIS, OPEN FOCUS"');};
-      rec.onend=()=>{listening=false;micBtn.classList.remove('live');micTxt.textContent='VOICE OFF';};
-      rec.onerror=(e)=>{toast('✕ MIC ERROR: '+e.error);};
-      rec.onresult=(e)=>{const t=e.results[e.results.length-1][0].transcript.trim();handleCommand(t);};
-      rec.start();
+
+  // A snapshot of the spine handed to the model each turn, so "how am I doing?"
+  // and "what should I work on?" answer from real data instead of guesses.
+  async function buildSpineContext(){
+    if(!liveHabits)return '';
+    const parts=[];
+    try{
+      const es=await dbSelect('SELECT * FROM energy_state ORDER BY date DESC LIMIT 1');
+      if(es&&es[0]){
+        const r=es[0];
+        parts.push(`Energy (${r.date}): body battery ${r.body_battery??'unknown'}, stress ${r.stress_level??'unknown'}, sleep quality ${r.sleep_quality??'unknown'}, slept ${r.sleep_hours??'unknown'}h, ${r.ceiling_remaining??'?'}h of his 5h daily study ceiling left.`);
+      }
+      if(HABITS.length){
+        parts.push('Habits this week: '+HABITS.map(h=>`${h.name} (${h.streak}, ${h.week.filter(Boolean).length}/7 days)`).join('; ')+'.');
+      }
+      const now=new Date();
+      parts.push(`Right now it is ${now.toLocaleString('en-US',{weekday:'long',hour:'numeric',minute:'2-digit'})}. His energy peaks late evening (21:00-24:00).`);
+    }catch(e){console.error('context build failed',e);}
+    return parts.join('\n');
+  }
+
+  async function askJarvisConversation(text){
+    if(!NATIVE){
+      toast('✕ NOT RECOGNIZED: "'+text+'" · (live conversation needs the desktop app)');
+      return;
+    }
+    // "remember ..." writes a durable note instead of burning an API call.
+    const mem=text.match(/^\s*(?:jarvis[,\s]+)?remember(?:\s+that)?[:,\s]+(.+)/i);
+    if(mem){
+      try{
+        const fact=await window.__TAURI__.core.invoke('remember',{fact:mem[1].trim()});
+        showTransmission('Noted. I\'ll remember that.','JARVIS','— SAVED TO MEMORY');
+        speak('Noted. I will remember that.');
+        toast('✓ REMEMBERED: '+fact);
+      }catch(e){toast('✕ MEMORY: '+e);}
+      return;
+    }
+    micTxt.textContent='THINKING…';
+    setCore('◦ THINKING ◦',text.length>34?text.slice(0,34)+'…':text);
+    try{
+      const context=await buildSpineContext();
+      const reply=await window.__TAURI__.core.invoke('ask_jarvis',{prompt:text,context});
+      const short=text.length>40?text.slice(0,40)+'…':text;
+      showTransmission(reply,'JARVIS','— IN REPLY TO "'+short.toUpperCase()+'"');
+      speak(reply);
+    }catch(e){
+      toast('✕ JARVIS: '+e);
+    }finally{
+      micTxt.textContent=listening?'LISTENING':'VOICE OFF';
+      restoreCoreIdle();
+    }
+  }
+  // Nav keywords are matched case-insensitively, but the LLM gets the original
+  // casing — lowercasing everything made for noticeably worse prompts.
+  function handleCommand(text){
+    const t=text.toLowerCase();
+    const map=[['focus','focus'],['plan','planner'],['project','projects'],['habit','habits'],['comm','comms'],['soundboard','comms'],['dashboard','dashboard'],['home','dashboard'],['main','dashboard']];
+    if(/wake up|daddy|power on|boot/i.test(t)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');return;}
+    for(const [kw,pg] of map){if(t.includes(kw)){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}}
+    if(t.includes('quote')||t.includes('julie')||t.includes('motivat')){go('dashboard');showLine();toast('▸ JULIE');return;}
+    askJarvisConversation(text);
+  }
+
+  // Native listener (desktop app). The webview's Web Speech API can't get mic
+  // permission on macOS — see src-tauri/speech/JarvisListen.swift — so the app
+  // shells out to a native AVFoundation helper instead. Browser keeps using
+  // webkitSpeechRecognition, which works fine there.
+  async function listenNative(){
+    if(listening)return;
+    // Only one thing can hold the mic — pause wake listening for the duration.
+    const resumeWake=wakeOn;
+    if(resumeWake)await setWake(false,true);
+    coreIdle={mode:coreModeEl.textContent,tag:coreTagEl.textContent};
+    setListeningUI(true);
+    setCore('◦ LISTENING ◦','SAY SOMETHING…');
+    toast('▸ VOICE ONLINE · JUST TALK');
+    try{
+      const text=await window.__TAURI__.core.invoke('listen_once');
+      setListeningUI(false);
+      restoreCoreIdle();
+      if(text)handleCommand(text);
+    }catch(e){
+      setListeningUI(false);
+      restoreCoreIdle();
+      toast('✕ MIC: '+e);
+    }finally{
+      if(resumeWake)setWake(true,true);
+    }
+  }
+  function listenBrowser(){
+    if(!SR){toast('✕ VOICE UNSUPPORTED · USE CHROME OVER HTTPS');return;}
+    if(listening){rec.stop();return;}
+    coreIdle={mode:coreModeEl.textContent,tag:coreTagEl.textContent};
+    rec=new SR();rec.continuous=true;rec.interimResults=true;rec.lang='en-US';
+    rec.onstart=()=>{setListeningUI(true);setCore('◦ LISTENING ◦','SAY SOMETHING…');toast('▸ VOICE ONLINE · JUST TALK');};
+    rec.onend=()=>{setListeningUI(false);if(!busy)restoreCoreIdle();};
+    rec.onerror=(e)=>{toast('✕ MIC ERROR: '+e.error);};
+    rec.onresult=(e)=>{
+      const res=e.results[e.results.length-1];
+      const t=res[0].transcript.trim();
+      if(!t)return;
+      if(res.isFinal){restoreCoreIdle();handleCommand(t);}else{coreTagEl.textContent=t;toast('🎙 '+t);}
+    };
+    rec.start();
+  }
+  function toggleListening(){NATIVE?listenNative():listenBrowser();}
+  micBtn.addEventListener('click',toggleListening);
+
+  // ---- hands-free wake word ("Jarvis, ...") ----
+  // Always-on mic, so the toggle is a hard mute: off actually stops the
+  // listener process rather than just ignoring it.
+  const wakeBtn=document.getElementById('wakeBtn'),wakeTxt=document.getElementById('wakeTxt');
+  let wakeOn=false;
+  async function setWake(on,quiet){
+    if(!NATIVE)return;
+    try{
+      await window.__TAURI__.core.invoke('set_wake_listening',{enabled:!!on});
+      wakeOn=!!on;
+      wakeBtn.classList.toggle('live',wakeOn);
+      wakeTxt.textContent=wakeOn?'WAKE ON':'WAKE OFF';
+      if(!quiet)toast(wakeOn?'▸ HANDS-FREE ON · SAY "JARVIS…"':'▸ HANDS-FREE OFF · MIC RELEASED');
+    }catch(e){
+      if(!quiet)toast('✕ WAKE: '+e);
+    }
+  }
+  if(NATIVE){
+    wakeBtn.style.display='';
+    wakeBtn.addEventListener('click',()=>setWake(!wakeOn));
+  }
+
+  if(NATIVE&&window.__TAURI__.event){
+    // Live transcription from the native helper, shown on the core while talking.
+    window.__TAURI__.event.listen('jarvis:partial',e=>{
+      const t=(e.payload||'').trim();
+      if(!t)return;
+      if(!listening&&!wakeOn)return;
+      coreTagEl.textContent=t.length>38?'…'+t.slice(-38):t;
     });
-  }else{
-    micBtn.addEventListener('click',()=>toast('✕ VOICE UNSUPPORTED · USE CHROME OVER HTTPS'));
+    window.__TAURI__.event.listen('jarvis:wake',e=>{
+      const t=(e.payload||'').trim();
+      if(!t)return;
+      coreIdle={mode:coreModeEl.textContent,tag:coreTagEl.textContent};
+      handleCommand(t);
+    });
+    window.__TAURI__.event.listen('jarvis:wake-error',e=>{
+      wakeOn=false;wakeBtn.classList.remove('live');wakeTxt.textContent='WAKE OFF';
+      toast('✕ WAKE: '+(e.payload||'stopped'));
+    });
   }
 
   // ---- keyboard shortcuts (nice fallback for demoing) ----
@@ -1024,6 +1219,98 @@
     if(e.code==='Space'&&current==='dashboard'){e.preventDefault();busy?(clearTimeout(hideTimer),hideLine()):showLine();}
     if(e.key==='Escape')go('dashboard');
   });
+
+  // ==========================================================
+  // LIVE SPINE WIRING (Tauri only — no-op on GitHub Pages, where
+  // window.__TAURI__ doesn't exist and the HUD stays pure mock data)
+  // ==========================================================
+  const SPINE_DB='sqlite:jarvis.db';
+  async function dbSelect(query,values=[]){
+    return window.__TAURI__.core.invoke('plugin:sql|select',{db:SPINE_DB,query,values});
+  }
+  async function dbExecute(query,values=[]){
+    return window.__TAURI__.core.invoke('plugin:sql|execute',{db:SPINE_DB,query,values});
+  }
+  function fmtDate(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+  function mondayOf(d){const dow=(d.getDay()+6)%7;const m=new Date(d);m.setDate(d.getDate()-dow);m.setHours(0,0,0,0);return m;}
+
+  async function loadDashboardLive(){
+    const es=await dbSelect('SELECT * FROM energy_state ORDER BY date DESC LIMIT 1');
+    if(es&&es[0]){
+      const r=es[0];
+      document.getElementById('bb').textContent=r.body_battery??'—';
+      document.getElementById('stress').textContent=r.stress_level??'—';
+      document.getElementById('sleep').textContent=r.sleep_quality??'—';
+      document.getElementById('ceil').textContent=r.ceiling_remaining!=null?r.ceiling_remaining:'—';
+      if(r.body_battery!=null)fillMeter('bb',r.body_battery);
+      if(r.stress_level!=null)fillMeter('stress',r.stress_level);
+      if(r.sleep_quality!=null)fillMeter('sleep',r.sleep_quality);
+      if(r.ceiling_remaining!=null)fillMeter('ceil',r.ceiling_remaining/5*100,true);
+    }
+    const fcDate=await dbSelect('SELECT date FROM energy_forecast ORDER BY date DESC LIMIT 1');
+    if(fcDate&&fcDate[0]){
+      const fc=await dbSelect('SELECT hour,energy,is_peak FROM energy_forecast WHERE date=$1 ORDER BY hour',[fcDate[0].date]);
+      const nowHour=new Date().getHours();
+      const cur=fc.find(x=>x.hour===nowHour)||fc[fc.length-1];
+      if(cur)document.getElementById('coreNum').textContent=cur.energy;
+      const peak=fc.find(x=>x.is_peak&&x.hour>nowHour)||fc.find(x=>x.is_peak);
+      if(peak)document.getElementById('coreTag').textContent='NEXT PEAK · '+String(peak.hour).padStart(2,'0')+':00';
+    }
+  }
+
+  function computeStreak(habitId,logByHabit){
+    const log=logByHabit[habitId]||{};
+    let streak=0;const d=new Date();d.setHours(0,0,0,0);
+    while(log[fmtDate(d)]){streak++;d.setDate(d.getDate()-1);}
+    return streak;
+  }
+
+  async function loadHabitsLive(){
+    const habitRows=await dbSelect('SELECT id,name FROM habits WHERE active=1 ORDER BY sort_order');
+    const since=new Date();since.setDate(since.getDate()-60);
+    const logRows=await dbSelect('SELECT habit_id,date,done FROM habit_log WHERE date>=$1',[fmtDate(since)]);
+    const logByHabit={};
+    logRows.forEach(r=>{(logByHabit[r.habit_id]=logByHabit[r.habit_id]||{})[r.date]=!!r.done;});
+    const monday=mondayOf(new Date());
+    const weekDates=[...Array(7)].map((_,i)=>{const d=new Date(monday);d.setDate(monday.getDate()+i);return fmtDate(d);});
+    HABITS.length=0;
+    habitRows.forEach(h=>{
+      const week=weekDates.map(d=>logByHabit[h.id]&&logByHabit[h.id][d]?1:0);
+      const streak=computeStreak(h.id,logByHabit);
+      HABITS.push({id:h.id,name:h.name,streak:streak>0?`${streak} DAY STREAK`:'0 · RESET',week});
+    });
+    liveHabits=true;habitWeekDates=weekDates;
+    const sub=document.getElementById('habitSub');if(sub)sub.textContent='LIVE · SPINE DB';
+    renderHabits();
+  }
+
+  async function toggleHabitDay(hi,di){
+    const h=HABITS[hi],date=habitWeekDates[di],newDone=h.week[di]?0:1;
+    try{
+      await dbExecute('INSERT INTO habit_log (habit_id,date,done) VALUES ($1,$2,$3) ON CONFLICT(habit_id,date) DO UPDATE SET done=excluded.done',[h.id,date,newDone]);
+      await loadHabitsLive();
+    }catch(e){console.error('habit toggle failed',e);}
+  }
+
+  (async function initSpine(){
+    const statusEl=document.getElementById('spineStatus');
+    if(!NATIVE){return;} // GitHub Pages / plain browser: stay mock, untouched
+    try{
+      await window.__TAURI__.core.invoke('plugin:sql|load',{db:SPINE_DB});
+      await loadDashboardLive();
+      await loadHabitsLive();
+      if(statusEl)statusEl.textContent='SPINE ONLINE · LIVE';
+      // The demo state switcher writes mock vitals straight over live DB values,
+      // so it only belongs in the browser demo.
+      const demobar=document.getElementById('demobar');
+      if(demobar)demobar.style.display='none';
+      const foot=document.getElementById('foot');
+      if(foot)foot.innerHTML='<b>LIVE</b> · PRESS THE CORE AND SPEAK · TAP ANY PANEL TO EXPAND';
+    }catch(e){
+      console.error('spine connect failed',e);
+      if(statusEl)statusEl.textContent='SPINE OFFLINE · DEMO MODE';
+    }
+  })();
 </script>
 </body>
 </html>

@@ -15,6 +15,9 @@ dist-ssr
 # Claude Code local session settings
 .claude/settings.local.json
 
+# Compiled speech helper — rebuilt from speech/*.swift by build.rs
+src-tauri/bin/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
