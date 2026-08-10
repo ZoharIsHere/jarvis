@@ -1220,6 +1220,54 @@
       return true;
     }
 
+    // "status" / "diagnostics" — what's actually wired, in plain language.
+    if(/\b(diagnostic|self ?check|systems? (check|status)|are you (ok|working)|what'?s broken)\b/.test(t)){
+      try{
+        const d=await window.__TAURI__.core.invoke('diagnostics');
+        const bits=[];
+        bits.push(d.spine_exists?`Spine online, ${Math.round(d.spine_bytes/1024)} kilobytes`:'Spine missing');
+        bits.push(d.speech_helper_found?'Speech helper ready':'Speech helper missing');
+        bits.push(d.llm&&d.llm.ready?`Brain: ${d.llm.provider}`:'No API key — conversation is offline, commands still work');
+        bits.push(d.wake_listening?'Wake word listening':'Wake word off');
+        const es=await dbSelect('SELECT date FROM energy_state ORDER BY date DESC LIMIT 1');
+        const fresh=es&&es[0]&&es[0].date===fmtDate(new Date());
+        bits.push(fresh?'Energy data is current':'Energy data is stale — Garmin has not run today');
+        const msg=bits.join('. ')+'.';
+        showTransmission(msg,'DIAGNOSTICS','— SYSTEM STATUS');
+        speak(msg);
+      }catch(e){toast('✕ DIAGNOSTICS: '+e);}
+      return true;
+    }
+
+    // "back up" — the one file holding everything.
+    if(/\b(back ?up|backup)\b.*\b(spine|database|db|everything)\b|\bback ?up now\b/.test(t)){
+      try{
+        const p=await window.__TAURI__.core.invoke('backup_spine');
+        toast('✓ BACKED UP');speak('Spine backed up.');
+        console.log('backup at',p);
+      }catch(e){toast('✕ BACKUP: '+e);speak("I couldn't back up the spine.");}
+      return true;
+    }
+
+    // "what was I doing yesterday" — context handoff from real history.
+    if(/\b(what (was|were) i (doing|working on))\b|\byesterday\b.*\b(do|did|work)\b/.test(t)){
+      try{
+        const y=new Date();y.setDate(y.getDate()-1);
+        const d=fmtDate(y);
+        const [blocks,apps]=await Promise.all([
+          dbSelect("SELECT label,start FROM plan_blocks WHERE date=$1 AND kind='focus' ORDER BY start",[d]),
+          dbSelect('SELECT app,SUM(minutes) AS m FROM app_usage WHERE date=$1 GROUP BY app ORDER BY m DESC LIMIT 3',[d]),
+        ]);
+        const bits=[];
+        if(blocks.length)bits.push('Planned: '+blocks.map(b=>b.label).join(', '));
+        if(apps.length)bits.push('Most time in '+apps.map(a=>`${a.app} (${Math.round(a.m/60*10)/10}h)`).join(', '));
+        const msg=bits.length?bits.join('. ')+'.':"I don't have anything logged for yesterday.";
+        showTransmission(msg,'YESTERDAY','— FROM THE SPINE');
+        speak(msg);
+      }catch(e){toast('✕ '+e);}
+      return true;
+    }
+
     // Let Julie answer on demand rather than only when she fires on her own.
     if(/\b(how am i|how'?s my|status|check my|am i ok|am i overdoing)\b/.test(t)){
       const nudges=await evaluateNudges();
@@ -1467,6 +1515,12 @@
     showNudge._t=setTimeout(()=>{alertbar.className='alertbar';},14000);
     toast('◦ JULIE · '+n.text);
     if(n.speak!==false)speak(n.spoken||n.text);
+    // The HUD now hides rather than quits, so an in-HUD-only nudge is a nudge
+    // nobody sees. Notification Center is the fallback surface.
+    if(NATIVE&&document.hidden){
+      window.__TAURI__.core.invoke('notify',
+        {title:'JARVIS · '+n.level.toUpperCase(),body:n.spoken||n.text}).catch(()=>{});
+    }
     logIntervention(n.level,n.id,n.text);
   }
 
@@ -1597,6 +1651,117 @@
         return;   // one at a time — stacked warnings read as nagging
       }
     }catch(e){console.error('nudge check failed',e);}
+  }
+
+  // ==========================================================
+  // SCHEDULED MODE — the third agent mode (on-demand / scheduled / continuous)
+  //
+  // Jobs live in `scheduled_jobs` so they survive restarts and are tunable
+  // without a rebuild. The loop runs here rather than in Rust because every
+  // job needs the spine, speech, or both — all of which live on this side.
+  // ==========================================================
+  const JOB_TICK_MS=60000;
+
+  function jobIsDue(job,now){
+    if(!job.enabled)return false;
+    const last=job.last_run?new Date(job.last_run.replace(' ','T')+'Z'):null;
+    const mins=m=>m*60000;
+    if(job.schedule==='interval'){
+      const every=mins(job.interval_minutes||60);
+      return !last||(now-last)>=every;
+    }
+    const [hh,mm]=(job.time_of_day||'09:00').split(':').map(n=>parseInt(n,10));
+    const target=new Date(now);target.setHours(hh,mm||0,0,0);
+    if(now<target)return false;                       // not time yet today
+    if(job.schedule==='weekly'){
+      const dow=(now.getDay()+6)%7;                   // 0=Mon
+      if(dow!==(job.weekday??6))return false;
+    }
+    // Fire once per day: skip if the last run was already after today's target.
+    return !last||last<target;
+  }
+
+  async function recordJobRun(job,status,detail){
+    try{
+      await dbExecute("UPDATE scheduled_jobs SET last_run=datetime('now'),last_status=$1 WHERE id=$2",
+        [status,job.id]);
+      await dbExecute('INSERT INTO job_runs (job_id,status,detail) VALUES ($1,$2,$3)',
+        [job.id,status,(detail||'').slice(0,500)]);
+    }catch(e){console.error('job record failed',e);}
+  }
+
+  async function runJob(job){
+    const inv=window.__TAURI__.core.invoke;
+    switch(job.kind){
+      case 'garmin':{
+        const r=await inv('run_garmin_collector');
+        await loadDashboardLive().catch(()=>{});
+        return r;
+      }
+      case 'spine_backup':
+        return await inv('backup_spine');
+      case 'weekly_review':{
+        const text=await weeklyReview();
+        await inv('notify',{title:'JARVIS · Weekly review',body:text.split('\n').slice(1,3).join(' · ')||'Review ready'});
+        showTransmission(text.split('\n').join(' · '),'WEEKLY REVIEW','— SCHEDULED');
+        speak(text.split('\n').slice(0,3).join('. '));
+        return 'delivered';
+      }
+      case 'morning_briefing':{
+        const text=await morningBriefing();
+        await inv('notify',{title:'JARVIS · Good morning',body:text.split('. ')[0]});
+        showTransmission(text,'MORNING BRIEFING','— SCHEDULED');
+        speak(text);
+        return 'delivered';
+      }
+      default:
+        throw new Error('unknown job kind: '+job.kind);
+    }
+  }
+
+  async function jobTick(){
+    if(!liveHabits)return;
+    try{
+      const jobs=await dbSelect('SELECT * FROM scheduled_jobs WHERE enabled=1');
+      const now=new Date();
+      for(const job of jobs){
+        if(!jobIsDue(job,now))continue;
+        try{
+          const detail=await runJob(job);
+          await recordJobRun(job,'ok',String(detail));
+          toast('✓ SCHEDULED · '+job.name);
+        }catch(e){
+          // A failing job must not stop the others, and must not retry hot.
+          await recordJobRun(job,'error',String(e));
+          console.error('job failed',job.name,e);
+        }
+        return;   // one job per tick keeps this off the critical path
+      }
+    }catch(e){console.error('job tick failed',e);}
+  }
+
+  // Spoken at a scheduled time: where the day stands before it starts.
+  async function morningBriefing(){
+    const parts=[];
+    const es=await dbSelect('SELECT * FROM energy_state ORDER BY date DESC LIMIT 1');
+    const e=es&&es[0]?es[0]:null;
+    if(e&&e.sleep_hours!=null)parts.push(`You slept ${e.sleep_hours} hours`);
+    if(e&&e.body_battery!=null)parts.push(`body battery is ${e.body_battery}`);
+    const ceil=e&&e.ceiling_remaining!=null?e.ceiling_remaining:null;
+    if(ceil!=null)parts.push(`you have ${ceil} hours of study ceiling today`);
+
+    const blocks=await dbSelect(
+      "SELECT start,label FROM plan_blocks WHERE date=$1 AND kind='focus' ORDER BY start LIMIT 3",
+      [fmtDate(new Date())]);
+    const dl=await dbSelect(
+      "SELECT title,due FROM deadlines WHERE status='open' ORDER BY due ASC LIMIT 2");
+
+    let out='Good morning. ';
+    out+=parts.length?parts.join(', ')+'. ':'I have no fresh vitals this morning. ';
+    if(blocks.length)out+=`First up: ${blocks[0].label} at ${blocks[0].start}. `;
+    else out+='Nothing is planned yet — say "plan my day" when you are ready. ';
+    if(dl.length)out+=`Nearest deadline: ${dl[0].title}, due ${dl[0].due}.`;
+    return out.trim();
   }
 
   // ==========================================================
@@ -1845,6 +2010,10 @@
       // point is that JARVIS keeps watching after you close the HUD.
       setInterval(sampleUsage,USAGE_SAMPLE_MS);
       setInterval(checkSustainedActivity,5*60*1000);
+      // Scheduled mode. First tick is delayed so a due job doesn't fire
+      // during boot.
+      setTimeout(jobTick,30000);
+      setInterval(jobTick,JOB_TICK_MS);
       // ⌥Space or the menu-bar icon re-summons; refresh so it isn't stale.
       if(window.__TAURI__.event){
         window.__TAURI__.event.listen('jarvis:summoned',()=>{

@@ -545,6 +545,120 @@ fn frontmost_app() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Post a real macOS notification.
+///
+/// The HUD now hides rather than quits, so a nudge shown only inside the HUD
+/// is a nudge nobody sees. This puts it in Notification Center instead.
+#[tauri::command]
+fn notify(title: String, body: String) -> Result<(), String> {
+    // Passed as separate args and escaped, so neither string is interpreted
+    // as AppleScript source.
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        esc(&body),
+        esc(&title)
+    );
+    Command::new("osascript")
+        .args(["-e", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("notify failed: {e}"))
+        .map(|_| ())
+}
+
+fn spine_path() -> PathBuf {
+    memory_dir().join("jarvis.db")
+}
+
+/// Copy the spine to a timestamped backup and prune old ones.
+///
+/// Everything JARVIS knows lives in one SQLite file that had no backup.
+#[tauri::command]
+fn backup_spine() -> Result<String, String> {
+    let src = spine_path();
+    if !src.exists() {
+        return Err("spine not found".into());
+    }
+    let dir = memory_dir().join("backups");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create backup dir: {e}"))?;
+
+    // Date comes from the OS rather than being formatted by hand.
+    let stamp = Command::new("date")
+        .args(["+%Y%m%d-%H%M%S"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "backup".to_string());
+
+    let dest = dir.join(format!("jarvis-{stamp}.db"));
+    // sqlite3 .backup would be safer mid-write, but a plain copy is adequate
+    // here: writes are short and this runs at 03:00.
+    std::fs::copy(&src, &dest).map_err(|e| format!("backup failed: {e}"))?;
+
+    // Keep the 14 most recent.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("jarvis-"))
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+        while files.len() > 14 {
+            let old = files.remove(0);
+            let _ = std::fs::remove_file(old.path());
+        }
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Run the Garmin collector. Blocked on a rate limit and a pending password
+/// rotation, so failure here is expected and reported rather than fatal.
+#[tauri::command]
+async fn run_garmin_collector() -> Result<String, String> {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("garmin_collector.py"))
+        .ok_or_else(|| "could not locate garmin_collector.py".to_string())?;
+    if !script.exists() {
+        return Err(format!("not found: {}", script.display()));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = Command::new("python3")
+            .arg(&script)
+            .output()
+            .map_err(|e| format!("could not run collector: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if out.status.success() {
+            Ok(stdout.lines().last().unwrap_or("done").to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("collector task failed: {e}"))?
+}
+
+/// What's actually wired up — turns "it's broken" into a specific answer.
+#[tauri::command]
+fn diagnostics() -> serde_json::Value {
+    let spine = spine_path();
+    let helper = speech_helper_path();
+    serde_json::json!({
+        "spine_path": spine.to_string_lossy(),
+        "spine_exists": spine.exists(),
+        "spine_bytes": std::fs::metadata(&spine).map(|m| m.len()).unwrap_or(0),
+        "memory_user_md": memory_dir().join("USER.md").exists(),
+        "memory_memory_md": memory_dir().join("MEMORY.md").exists(),
+        "speech_helper": helper.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "speech_helper_found": helper.is_some(),
+        "llm": llm_status(),
+        "wake_listening": WAKE_ON.load(std::sync::atomic::Ordering::SeqCst),
+        "locale": std::env::var("JARVIS_LOCALE").unwrap_or_else(|_| "en-US".into()),
+    })
+}
+
 /// Show and focus the HUD from anywhere.
 fn summon(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -591,6 +705,12 @@ pub fn run() {
                             version: 2,
                             description: "habits_002",
                             sql: include_str!("../migrations/002_habits.sql"),
+                            kind: MigrationKind::Up,
+                        },
+                        Migration {
+                            version: 3,
+                            description: "scheduler_003",
+                            sql: include_str!("../migrations/003_scheduler.sql"),
                             kind: MigrationKind::Up,
                         },
                     ],
@@ -681,7 +801,11 @@ pub fn run() {
             stop_speaking,
             idle_seconds,
             frontmost_app,
-            hide_window
+            hide_window,
+            notify,
+            backup_spine,
+            run_garmin_collector,
+            diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
