@@ -94,9 +94,6 @@ fn reset_conversation() {
 // the frontend, which already holds the DB connection.
 #[tauri::command]
 async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, String> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY not set — export it before launching the app".to_string())?;
-
     let mut system = PERSONA.to_string();
     let memories = read_memory_files();
     if !memories.is_empty() {
@@ -122,14 +119,6 @@ async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, S
         hist.clone()
     };
 
-    let body = serde_json::json!({
-        "model": "claude-sonnet-5",
-        "max_tokens": 300,
-        "system": system,
-        "messages": messages,
-    });
-
-    let client = HTTP.get_or_init(reqwest::Client::new);
     // On any failure the just-added user turn is rolled back, otherwise the next
     // call would send two consecutive user messages and the API would reject it.
     fn rollback() {
@@ -138,7 +127,82 @@ async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, S
         }
     }
 
-    let resp = match client
+    let result = match provider() {
+        Provider::Ollama => ask_ollama(&system, &messages).await,
+        Provider::Anthropic => ask_anthropic(&system, &messages).await,
+    };
+
+    let text = match result {
+        Ok(t) if !t.trim().is_empty() => t,
+        Ok(_) => {
+            rollback();
+            return Err("empty response".to_string());
+        }
+        Err(e) => {
+            rollback();
+            return Err(e);
+        }
+    };
+
+    if let Ok(mut hist) = HISTORY.lock() {
+        hist.push(serde_json::json!({"role": "assistant", "content": text}));
+    }
+    Ok(text)
+}
+
+/// Which brain answers. Defaults to Anthropic; `JARVIS_LLM=ollama` switches to a
+/// local model. The PRD's rule is that local stays the privacy-safe path and
+/// cloud sits behind a switch — never the other way round.
+enum Provider {
+    Anthropic,
+    Ollama,
+}
+
+fn provider() -> Provider {
+    match std::env::var("JARVIS_LLM").as_deref().map(str::trim) {
+        Ok("ollama") | Ok("local") => Provider::Ollama,
+        _ => Provider::Anthropic,
+    }
+}
+
+/// Reports the active brain so the HUD can show it.
+#[tauri::command]
+fn llm_status() -> serde_json::Value {
+    match provider() {
+        Provider::Ollama => serde_json::json!({
+            "provider": "ollama",
+            "model": ollama_model(),
+            "ready": true,
+        }),
+        Provider::Anthropic => serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "ready": std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        }),
+    }
+}
+
+fn ollama_model() -> String {
+    std::env::var("JARVIS_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2:1b".to_string())
+}
+
+fn ollama_url() -> String {
+    std::env::var("JARVIS_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string())
+}
+
+async fn ask_anthropic(system: &str, messages: &[serde_json::Value]) -> Result<String, String> {
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| "ANTHROPIC_API_KEY not set — export it before launching the app".to_string())?;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 300,
+        "system": system,
+        "messages": messages,
+    });
+
+    let resp = HTTP
+        .get_or_init(reqwest::Client::new)
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
@@ -146,16 +210,9 @@ async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, S
         .json(&body)
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            rollback();
-            return Err(format!("request failed: {e}"));
-        }
-    };
+        .map_err(|e| format!("request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        rollback();
         let status = resp.status();
         let detail = resp
             .json::<serde_json::Value>()
@@ -171,24 +228,49 @@ async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, S
         return Err(detail);
     }
 
-    let parsed: AnthropicResponse = match resp.json().await {
-        Ok(p) => p,
-        Err(e) => {
-            rollback();
-            return Err(format!("parse failed: {e}"));
-        }
-    };
+    let parsed: AnthropicResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse failed: {e}"))?;
+    Ok(parsed.content.into_iter().map(|b| b.text).collect())
+}
 
-    let text: String = parsed.content.into_iter().map(|b| b.text).collect();
-    if text.trim().is_empty() {
-        rollback();
-        return Err("empty response".to_string());
+/// Local model via Ollama's chat API. Ollama takes the system prompt as a
+/// message rather than a separate field.
+async fn ask_ollama(system: &str, messages: &[serde_json::Value]) -> Result<String, String> {
+    let mut msgs = vec![serde_json::json!({"role": "system", "content": system})];
+    msgs.extend_from_slice(messages);
+
+    let body = serde_json::json!({
+        "model": ollama_model(),
+        "messages": msgs,
+        "stream": false,
+        "options": { "num_predict": 200 },
+    });
+
+    let resp = HTTP
+        .get_or_init(reqwest::Client::new)
+        .post(format!("{}/api/chat", ollama_url()))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("ollama unreachable ({e}) — is `ollama serve` running?"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ollama error {status}: {body}"));
     }
 
-    if let Ok(mut hist) = HISTORY.lock() {
-        hist.push(serde_json::json!({"role": "assistant", "content": text}));
-    }
-    Ok(text)
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("ollama parse failed: {e}"))?;
+    Ok(v.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string())
 }
 
 // The speech helper ships next to the app binary (Tauri strips the target-triple
@@ -401,7 +483,8 @@ pub fn run() {
             speak_native,
             remember,
             reset_conversation,
-            set_wake_listening
+            set_wake_listening,
+            llm_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
