@@ -415,9 +415,30 @@ Conversation history is a 20-turn rolling window held in Rust memory — deliber
 
 ### Known gaps
 
-- Local build environment: `/usr/local/include/Block.h` (stray 2018 liblzma file) shadows the system header and breaks Swift builds. Worked around in `build.rs` by forcing SDK includes first — the stray file was left alone rather than deleted.
-- Wake word matches `jarvis`/`jervis`/`travis` (common mishears). False positives are possible; the hard mute is the mitigation.
-- Every non-navigation utterance is a Claude API call — no local model fallback yet.
+- Local build environment: `/usr/local/include/Block.h` (stray 2018 liblzma file) shadows the system header and breaks Swift builds. Worked around in `build.rs` by forcing SDK includes first — the stray file was left alone rather than deleted. Same stray-header problem blocks `whisper.cpp` (needs `cmake`, and Homebrew can't build on this machine's Command Line Tools).
+- Wake word matches `jarvis`/`jervis`/`travis` (common mishears). False positives are possible; the hard mute is the mitigation. [Porcupine](https://github.com/Picovoice/porcupine) is the proper fix.
+- macOS `say -v Daniel` is free but audibly synthetic. [Piper](https://github.com/rhasspy/piper) is the free local upgrade; ElevenLabs is the paid one.
+
+### Which brain answers
+
+`JARVIS_LLM` selects the provider (Anthropic by default, `ollama` for a local
+model) — see **[`docs/BRAINS.md`](docs/BRAINS.md)** for measured latency and
+quality across four local models on this hardware, published cloud pricing,
+and the cost of an actual JARVIS conversation.
+
+Short version: local inference was benchmarked on this machine and **is not
+viable** — a 2017 dual-core 15W chip with no GPU path has a ~12.5s floor, and
+every small model tested fabricated details it was given. The switch exists so
+that moving to Apple Silicon later is a one-line change.
+
+### Prior art
+
+**[`docs/PRIOR_ART.md`](docs/PRIOR_ART.md)** surveys what already exists —
+other JARVIS projects, serious open assistants worth learning from, and
+drop-in building blocks for STT/TTS/wake-word. It closes with the one
+architectural idea that matters most next: **tool calling**, which is what
+turns "LifeOS shows state; JARVIS changes state" (§0) from a slogan into
+something true.
 
 ---
 
