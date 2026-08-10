@@ -431,6 +431,14 @@ viable** — a 2017 dual-core 15W chip with no GPU path has a ~12.5s floor, and
 every small model tested fabricated details it was given. The switch exists so
 that moving to Apple Silicon later is a one-line change.
 
+### Where this is going
+
+**[`docs/ROADMAP.md`](docs/ROADMAP.md)** is the execution plan — 10 phases,
+each useful on its own, with the problems each one is likely to hit and the
+mitigation for each. **[`docs/YOUR_TODO.md`](docs/YOUR_TODO.md)** is the
+single list of things only Zohar can do (rotate credentials, API key, Tuya
+account, Android device); everything else is mine to build.
+
 ### Prior art
 
 **[`docs/PRIOR_ART.md`](docs/PRIOR_ART.md)** surveys what already exists —
