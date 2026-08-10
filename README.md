@@ -9,9 +9,10 @@ dashboard styled after a fictional AI assistant.
 
 ![JARVIS dashboard screenshot](docs/screenshot.png)
 
-The demo above is `hud/index.html` running standalone against mock data —
-it's the same file the Tauri app is meant to load, but the app itself
-doesn't point at it yet (see [Known limitations](#known-limitations--in-progress)).
+The demo above is `hud/index.html` running standalone against mock data.
+The Tauri desktop app now loads this same file directly (see [Known
+limitations](#known-limitations--in-progress) for what's still mock vs.
+live).
 
 ## Architecture: the spine
 
@@ -30,15 +31,20 @@ Future collectors ─┘         (SQLite)
 
 Concretely:
 
-- The schema lives in [`src-tauri/migrations/001_spine.sql`](src-tauri/migrations/001_spine.sql)
-  and is applied automatically by the `tauri-plugin-sql` migration runner
-  in [`src-tauri/src/lib.rs`](src-tauri/src/lib.rs).
+- The schema lives in [`src-tauri/migrations/`](src-tauri/migrations)
+  and is applied by the `tauri-plugin-sql` migration runner in
+  [`src-tauri/src/lib.rs`](src-tauri/src/lib.rs) — but only once
+  something on the frontend actually opens the database via the plugin's
+  JS API. `hud/index.html` doesn't do that yet (it's still mock data
+  throughout), so in practice migrations only run when a frontend build
+  that calls `Database.load()` is in place.
 - Tables include `energy_state` / `energy_forecast` / `energy_log` (body
   battery, sleep, stress, and a rule-based hourly energy curve),
   `deadlines` and `tasks` (the planner's input pool), `plan_blocks`
   (today's schedule), `interventions` (anti-burnout history),
-  `checkins`, `app_usage`, and `settings` (tunable thresholds instead of
-  hardcoded constants).
+  `checkins`, `app_usage`, `settings` (tunable thresholds instead of
+  hardcoded constants), and `habits` / `habit_log` (habit definitions and
+  daily check-ins — streaks are computed from the log, not stored).
 - [`garmin_collector.py`](garmin_collector.py) is a standalone Python
   script, run on a schedule (e.g. via `launchd`), that pulls body
   battery / stress / sleep from Garmin Connect, computes a rule-based
@@ -54,12 +60,13 @@ to know any other subsystem exists.
 ## Project layout
 
 ```
-hud/index.html          Standalone HUD demo (six pages, mock data) — deployed to GitHub Pages
+hud/index.html          The HUD (six pages, mock data) — deployed to GitHub Pages,
+                         and what the Tauri app's window now loads directly
 garmin_collector.py      Garmin → spine collector (run separately, see below)
-src/                     Tauri app frontend (currently default Vite/Tauri boilerplate)
+src/                     Unused Vite/Tauri starter frontend, kept for reference
 src-tauri/               Tauri app backend (Rust)
   src/lib.rs             App entrypoint, SQL migration wiring
-  migrations/            SQLite schema migrations (only 001_spine.sql exists so far)
+  migrations/            SQLite schema migrations (001_spine.sql, 002_habits.sql)
 ```
 
 ## Running it
@@ -90,11 +97,12 @@ don't need the password again. It writes into
 
 ### The Tauri app
 
-On Intel Macs with only the Xcode Command Line Tools installed (no full
-Xcode), the SDK path needs to be set explicitly before `tauri dev`:
+Opens a native window loading `hud/index.html` directly — no Vite build
+in the loop. On Intel Macs with only the Xcode Command Line Tools
+installed (no full Xcode), the SDK path needs to be set explicitly
+before `tauri dev`:
 
 ```bash
-npm install
 export SDKROOT=$(xcrun --show-sdk-path)
 npm run tauri dev
 ```
@@ -104,25 +112,32 @@ npm run tauri dev
 This is an active work-in-progress personal project, not a finished
 product. Specifically, right now:
 
-- **The Tauri app doesn't load the HUD yet.** `hud/index.html` is a
-  standalone file; the actual app window still renders the default
-  Tauri/Vite starter page (`index.html` / `src/main.ts`). Wiring the
-  app's `frontendDist` to the HUD is the next step.
+- **The HUD still runs on mock data, even inside the Tauri app.** The
+  app's window now loads `hud/index.html` directly (`frontendDist` in
+  `tauri.conf.json` points at `../hud`), but that file has no
+  `@tauri-apps/plugin-sql` calls in it — it doesn't read or write the
+  spine at all yet. Every page (Dashboard, Focus, Planner, Projects,
+  Habits, Comms) is still hardcoded JS data. Actually wiring the HUD's
+  JS to `Database.load("sqlite:jarvis.db")` and real queries is the
+  next real step here.
 - **The Garmin collector is ~90% done.** It authenticates, pulls body
   battery / stress / sleep, computes an energy forecast, and writes to
-  the spine — but it's currently paused on saving the auth token after
-  hitting Garmin's rate limit, so it hasn't been run end-to-end yet.
-- **Habits has no backing table.** The HUD's "Habits" page is UI/mock
-  data only. A `002_habits.sql` migration doesn't exist yet and isn't
-  registered in `src-tauri/src/lib.rs` — habit tracking isn't wired
-  into the spine at all so far.
-- **Only one migration exists.** `energy_*`, `deadlines`, `tasks`,
-  `plan_blocks`, `interventions`, `checkins`, `app_usage`, and
-  `settings` tables are defined; everything else the HUD displays
-  (e.g. habits, some Comms/Projects content) is still mock data with no
-  live source.
-- **No Notion integration yet**, despite the HUD referencing it —
-  that's mocked for now too.
+  the spine — but the last real attempt got rate-limited by Garmin
+  before a token could be cached, and the Garmin password from that
+  attempt is being rotated (see [Security note](#security-note)). It
+  needs one successful manual run with the new password, once Garmin's
+  rate limit clears, before it can go back on a schedule.
+- **`habits` / `habit_log` exist in the schema now** (`002_habits.sql`,
+  registered in `src-tauri/src/lib.rs`) but nothing writes to them yet —
+  the Habits page's streaks/weekly grid are still the hardcoded `HABITS`
+  array in `hud/index.html`, not a query. Note also that
+  `tauri-plugin-sql` only runs pending migrations when something calls
+  `Database.load()` from the frontend, which — see above — nothing does
+  yet. `002_habits.sql` was applied directly to the local spine DB by
+  hand to unblock this, since it's idempotent and safe to also run via
+  the plugin later.
+- **No Notion integration**, despite the HUD referencing it — mocked
+  for now.
 
 ## Security note
 

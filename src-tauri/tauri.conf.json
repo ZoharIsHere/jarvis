@@ -4,18 +4,15 @@
   "version": "0.1.0",
   "identifier": "com.hila.jarvis",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "frontendDist": "../hud"
   },
   "app": {
     "withGlobalTauri": true,
     "windows": [
       {
         "title": "jarvis",
-        "width": 800,
-        "height": 600
+        "width": 1440,
+        "height": 900
       }
     ],
     "security": {

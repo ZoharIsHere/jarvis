@@ -13,12 +13,20 @@ pub fn run() {
             SqlBuilder::default()
                 .add_migrations(
                     "sqlite:jarvis.db",
-                    vec![Migration {
-                        version: 1,
-                        description: "spine_001",
-                        sql: include_str!("../migrations/001_spine.sql"),
-                        kind: MigrationKind::Up,
-                    }],
+                    vec![
+                        Migration {
+                            version: 1,
+                            description: "spine_001",
+                            sql: include_str!("../migrations/001_spine.sql"),
+                            kind: MigrationKind::Up,
+                        },
+                        Migration {
+                            version: 2,
+                            description: "habits_002",
+                            sql: include_str!("../migrations/002_habits.sql"),
+                            kind: MigrationKind::Up,
+                        },
+                    ],
                 )
                 .build(),
         )
