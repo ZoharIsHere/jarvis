@@ -428,6 +428,21 @@ fn set_wake_listening(app: AppHandle, enabled: bool) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The currently-speaking `say` process, so it can be interrupted.
+static SPEAKING: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+/// Stop JARVIS mid-sentence. Barge-in: the user shouldn't have to wait for
+/// him to finish before talking back.
+#[tauri::command]
+fn stop_speaking() {
+    if let Ok(mut guard) = SPEAKING.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Speak text using the system voice. WKWebView's speechSynthesis is
 /// unreliable in a packaged app, and macOS ships better voices anyway.
 #[tauri::command]
@@ -435,17 +450,46 @@ async fn speak_native(text: String, voice: Option<String>) -> Result<(), String>
     if text.trim().is_empty() {
         return Ok(());
     }
+    // Whatever was being said is now stale — cut it off rather than queueing.
+    stop_speaking();
+
     let voice = voice.unwrap_or_else(|| "Daniel".to_string());
     tauri::async_runtime::spawn_blocking(move || {
         // Passed as separate args (never through a shell), so text is not interpreted.
-        Command::new("say")
+        let child = Command::new("say")
             .args(["-v", &voice, "-r", "185", "--", &text])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("say failed: {e}"))
-            .map(|_| ())
+            .spawn()
+            .map_err(|e| format!("say failed: {e}"))?;
+
+        if let Ok(mut guard) = SPEAKING.lock() {
+            *guard = Some(child);
+        }
+        // Wait outside the lock so stop_speaking() can interrupt mid-sentence.
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let mut guard = match SPEAKING.lock() {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+            match guard.as_mut() {
+                Some(c) => match c.try_wait() {
+                    Ok(Some(_)) => {
+                        *guard = None;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        *guard = None;
+                        break;
+                    }
+                },
+                None => break, // interrupted by stop_speaking()
+            }
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("speech task failed: {e}"))?
@@ -484,7 +528,8 @@ pub fn run() {
             remember,
             reset_conversation,
             set_wake_listening,
-            llm_status
+            llm_status,
+            stop_speaking
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1115,12 +1115,109 @@
       restoreCoreIdle();
     }
   }
+  // ---- commands that change state, not just navigate ----
+  // These run on plain keyword matching so they work with no API key and no
+  // model round-trip. Once tool calling lands these become tool definitions;
+  // until then this is how JARVIS actually *does* things rather than
+  // describing them.
+
+  // Habit names are matched on their significant words, so "Study ≥2h"
+  // is reachable by saying "study" and "Novel · 1 scene" by "novel".
+  function habitKeywords(name){
+    return name.toLowerCase().replace(/[^a-z\s]/g,' ').split(/\s+/)
+      .filter(w=>w.length>2&&!['the','and','for','with','by','in','no'].includes(w));
+  }
+  function matchHabit(text){
+    if(!liveHabits)return null;
+    let best=null,bestLen=0;
+    for(const h of HABITS){
+      for(const kw of habitKeywords(h.name)){
+        if(text.includes(kw)&&kw.length>bestLen){best=h;bestLen=kw.length;}
+      }
+    }
+    return best;
+  }
+  async function markHabitToday(habit,done){
+    const date=fmtDate(new Date());
+    await dbExecute(
+      'INSERT INTO habit_log (habit_id,date,done) VALUES ($1,$2,$3) ON CONFLICT(habit_id,date) DO UPDATE SET done=excluded.done',
+      [habit.id,date,done?1:0]);
+    await loadHabitsLive();
+  }
+
+  async function tryActionCommand(text){
+    const t=text.toLowerCase();
+
+    // "I ran" / "mark study done" / "didn't run today"
+    const undo=/\b(didn'?t|did not|un ?mark|not done|undo)\b/.test(t);
+    const doneVerb=/\b(done|did|finished|completed|mark|ran|went)\b/.test(t);
+    if(doneVerb||undo){
+      const h=matchHabit(t);
+      if(h){
+        try{
+          await markHabitToday(h,!undo);
+          const msg=undo?`Cleared ${h.name} for today.`:`Marked ${h.name} done. Nice.`;
+          toast('✓ '+msg);speak(msg);
+          go('habits');
+        }catch(e){toast('✕ HABIT: '+e);}
+        return true;
+      }
+    }
+
+    // Self-reported fuel — feeds the energy model per JARVIS_MASTER.md §3.1c.
+    const fuel=/\b(i'?m |i am |feeling )?(fried|exhausted|wrecked|dead|drained)\b/.test(t) ? 1
+             : /\b(i'?m |i am |feeling )?(tired|low|rough|meh)\b/.test(t) ? 2
+             : /\b(i'?m |i am |feeling )?(ok|okay|fine|alright)\b/.test(t) ? 3
+             : /\b(i'?m |i am |feeling )?(good|solid|strong|great|sharp)\b/.test(t) ? 4
+             : null;
+    if(fuel!==null&&/\b(i'?m|i am|feeling|check ?in|fuel)\b/.test(t)){
+      try{
+        await dbExecute('INSERT INTO checkins (fuel) VALUES ($1)',[fuel]);
+        const reply=fuel<=1?"Noted. I'll keep the load light."
+                   :fuel<=2?"Noted. Let's not push it today."
+                   :fuel<=3?"Noted."
+                   :"Good. Let's use it.";
+        toast('✓ CHECK-IN LOGGED · FUEL '+fuel+'/4');speak(reply);
+      }catch(e){toast('✕ CHECK-IN: '+e);}
+      return true;
+    }
+
+    // Focus block — sets the flag the rest of the system reads.
+    if(/\b(start|begin|enter)\b.*\bfocus\b|\block in\b/.test(t)){
+      try{
+        await dbExecute("UPDATE state_flags SET value='1',updated_at=datetime('now') WHERE key='listening_enabled'");
+        go('focus');
+        const el=document.getElementById('focusStart');if(el)el.click();
+        speak("Entering focus mode. I'll hold your calls and silence the noise.");
+      }catch(e){toast('✕ FOCUS: '+e);}
+      return true;
+    }
+
+    // Let Julie answer on demand rather than only when she fires on her own.
+    if(/\b(how am i|how'?s my|status|check my|am i ok|am i overdoing)\b/.test(t)){
+      const nudges=await evaluateNudges();
+      if(nudges.length){showNudge(Object.assign({},nudges[0],{speak:true}));}
+      else{
+        const msg='Everything reads nominal. You are cleared to work.';
+        toast('✓ '+msg);speak(msg);
+      }
+      return true;
+    }
+    return false;
+  }
+
   // Nav keywords are matched case-insensitively, but the LLM gets the original
   // casing — lowercasing everything made for noticeably worse prompts.
-  function handleCommand(text){
+  async function handleCommand(text){
     const t=text.toLowerCase();
-    const map=[['focus','focus'],['plan','planner'],['project','projects'],['habit','habits'],['comm','comms'],['soundboard','comms'],['dashboard','dashboard'],['home','dashboard'],['main','dashboard']];
     if(/wake up|daddy|power on|boot/i.test(t)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');return;}
+    // State-changing commands take precedence over navigation, so "mark focus
+    // done" logs a habit instead of just opening the Focus page.
+    if(NATIVE&&liveHabits){
+      try{ if(await tryActionCommand(text))return; }
+      catch(e){console.error('action command failed',e);}
+    }
+    const map=[['focus','focus'],['plan','planner'],['project','projects'],['habit','habits'],['comm','comms'],['soundboard','comms'],['dashboard','dashboard'],['home','dashboard'],['main','dashboard']];
     for(const [kw,pg] of map){if(t.includes(kw)){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}}
     if(t.includes('quote')||t.includes('julie')||t.includes('motivat')){go('dashboard');showLine();toast('▸ JULIE');return;}
     askJarvisConversation(text);
@@ -1132,6 +1229,9 @@
   // webkitSpeechRecognition, which works fine there.
   async function listenNative(){
     if(listening)return;
+    // Barge-in: talking over JARVIS cuts him off instead of queueing behind him.
+    window.__TAURI__.core.invoke('stop_speaking').catch(()=>{});
+    if(busy){clearTimeout(hideTimer);hideLine();}
     // Only one thing can hold the mic — pause wake listening for the duration.
     const resumeWake=wakeOn;
     if(resumeWake)await setWake(false,true);
@@ -1292,6 +1392,181 @@
     }catch(e){console.error('habit toggle failed',e);}
   }
 
+  // ==========================================================
+  // JULIE — the anti-burnout monitor ("the fire extinguisher")
+  //
+  // Watches the spine and speaks up unprompted. Detection is plain code
+  // (per JARVIS_MASTER.md §3.4: thresholds are code, only phrasing would
+  // ever be AI); thresholds come from the settings table rather than being
+  // hardcoded, so they're tunable without a rebuild.
+  //
+  // Graduated: spark (gentle) → smoke (suggest a change) → fire (act).
+  // Every nudge is logged to `interventions` so the energy model can later
+  // learn which ones actually worked.
+  // ==========================================================
+  const NUDGE_POLL_MS=60000;
+  const NUDGE_COOLDOWN_MS=25*60*1000;   // don't repeat the same nudge for 25 min
+  const lastNudgeAt={};
+  let settingsCache=null;
+
+  async function loadSettings(){
+    if(settingsCache)return settingsCache;
+    const rows=await dbSelect('SELECT key,value FROM settings');
+    settingsCache={};
+    rows.forEach(r=>{settingsCache[r.key]=r.value;});
+    return settingsCache;
+  }
+  const num=(s,k,d)=>{const v=parseFloat(s[k]);return isNaN(v)?d:v;};
+
+  async function logIntervention(level,trigger,action){
+    try{
+      await dbExecute(
+        'INSERT INTO interventions (level,trigger,action,authority_mode) VALUES ($1,$2,$3,$4)',
+        [level,trigger,action,'advisory']);
+    }catch(e){console.error('intervention log failed',e);}
+  }
+
+  function showNudge(n){
+    alertbar.className='alertbar show'+(n.level==='fire'?'':' gray');
+    alertIcon.textContent=n.level==='fire'?'▲':n.level==='smoke'?'▽':'◦';
+    alertTxt.textContent=n.text;
+    alertCode.textContent=n.code||'';
+    clearTimeout(showNudge._t);
+    showNudge._t=setTimeout(()=>{alertbar.className='alertbar';},14000);
+    toast('◦ JULIE · '+n.text);
+    if(n.speak!==false)speak(n.spoken||n.text);
+    logIntervention(n.level,n.id,n.text);
+  }
+
+  // Each rule returns a nudge or null. Ordered most-urgent first; only the
+  // top firing rule speaks, so JARVIS never stacks three warnings at once.
+  async function evaluateNudges(){
+    const s=await loadSettings();
+    const now=new Date(), hour=now.getHours();
+    const out=[];
+
+    const es=await dbSelect('SELECT * FROM energy_state ORDER BY date DESC LIMIT 1');
+    const e=es&&es[0]?es[0]:null;
+
+    if(e){
+      const stress=e.stress_level, batt=e.body_battery, sleep=e.sleep_quality;
+      const ceil=e.ceiling_remaining;
+
+      if(stress!=null&&stress>=num(s,'danger_stress_threshold',90)){
+        out.push({id:'stress_danger',level:'fire',
+          text:'STRESS CRITICAL · HARD BLOCKS CLEARED',
+          code:`ERR · STRESS ${stress} ≥ ${num(s,'danger_stress_threshold',90)}`,
+          spoken:"Your stress is critical. I'm clearing the hard blocks. Rest is part of the protocol."});
+      }else if(stress!=null&&stress>=num(s,'red_stress_threshold',75)){
+        out.push({id:'stress_high',level:'smoke',
+          text:'STRESS THRESHOLD EXCEEDED · HARD BLOCKS NOT ADVISED',
+          code:`WARN · STRESS ${stress} ≥ ${num(s,'red_stress_threshold',75)}`,
+          spoken:"Your stress is above threshold. I wouldn't take on anything hard right now."});
+      }
+
+      if(batt!=null&&batt<=num(s,'danger_battery_threshold',12)){
+        out.push({id:'batt_danger',level:'fire',
+          text:'BODY BATTERY CRITICAL · RECOVERY ONLY',
+          code:`ERR · BATT ${batt}`,
+          spoken:"Your body battery is nearly empty. Recovery only from here."});
+      }else if((batt!=null&&batt<=num(s,'gray_battery_threshold',25))||
+               (sleep!=null&&sleep<=num(s,'gray_sleep_threshold',30))){
+        out.push({id:'reduced_capacity',level:'smoke',
+          text:'REDUCED CAPACITY · CEILING CUT',
+          code:`WARN · BATT ${batt??'—'} · SLEEP ${sleep??'—'}`,
+          spoken:"You're running on reduced capacity today. I'd cut the ceiling."});
+      }
+
+      // Approaching the daily study ceiling — the signature spark.
+      if(ceil!=null&&ceil>0&&ceil<=0.5){
+        out.push({id:'ceiling_near',level:'spark',
+          text:'APPROACHING STUDY CEILING',
+          code:`${ceil}H REMAINING`,
+          spoken:`You're about ${Math.round(ceil*60)} minutes from your ceiling. Want to bank the win and stop?`});
+      }else if(ceil!=null&&ceil<=0){
+        out.push({id:'ceiling_hit',level:'fire',
+          text:'STUDY CEILING REACHED',code:'0H REMAINING',
+          spoken:"That's your ceiling for today. I'm calling it."});
+      }
+    }
+
+    // Garmin is the primary signal, but it isn't always there (no token, rate
+    // limit, offline). A recent self-reported check-in is the fallback, so
+    // Julie still has something to reason about — manual override always wins
+    // over inferred state, per JARVIS_MASTER.md §3.1.
+    const noVitals=!e||(e.body_battery==null&&e.stress_level==null&&e.sleep_quality==null);
+    if(noVitals){
+      const ci=await dbSelect(
+        "SELECT fuel,ts FROM checkins WHERE ts >= datetime('now','-6 hours') ORDER BY ts DESC LIMIT 1");
+      if(ci&&ci[0]&&ci[0].fuel!=null){
+        const fuel=ci[0].fuel;
+        if(fuel<=1){
+          out.push({id:'fuel_empty',level:'fire',
+            text:'SELF-REPORTED: RUNNING ON EMPTY · RECOVERY ONLY',
+            code:`FUEL ${fuel}/4 · NO GARMIN DATA`,
+            spoken:"You told me you're fried. That's enough for now — I'm calling it."});
+        }else if(fuel<=2){
+          out.push({id:'fuel_low',level:'smoke',
+            text:'SELF-REPORTED: LOW FUEL · EASE THE LOAD',
+            code:`FUEL ${fuel}/4 · NO GARMIN DATA`,
+            spoken:"You said you're running low. Let's keep today light."});
+        }
+      }
+    }
+
+    // Peak window — the opposite of a warning: use it.
+    const fc=await dbSelect(
+      'SELECT hour,is_peak FROM energy_forecast WHERE date=(SELECT MAX(date) FROM energy_forecast) AND hour=$1',[hour]);
+    if(fc&&fc[0]&&fc[0].is_peak){
+      out.push({id:'peak_now',level:'spark',
+        text:'PEAK WINDOW OPEN · SAVE THE HARD WORK FOR NOW',
+        code:`${String(hour).padStart(2,'0')}:00`,
+        spoken:"You're in your peak window. This is the time for the hard problems."});
+    }
+
+    // Sleep protocol — the plans made now aren't worth the rest they cost.
+    if(hour>=2&&hour<5){
+      out.push({id:'sleep_guard',level:'smoke',
+        text:'SLEEP PROTOCOL · IT IS LATE',
+        code:String(hour).padStart(2,'0')+':00',
+        spoken:"It's late. The plans you make now won't beat the rest you'd trade for them."});
+    }
+
+    // A streak about to break — only worth saying once the day is nearly gone.
+    if(hour>=20&&liveHabits){
+      const atRisk=HABITS.filter(h=>{
+        const m=/^(\d+) DAY STREAK$/.exec(h.streak||'');
+        const todayIdx=(new Date().getDay()+6)%7;
+        return m&&parseInt(m[1],10)>=3&&!h.week[todayIdx];
+      });
+      if(atRisk.length){
+        const h=atRisk[0];
+        out.push({id:'streak_'+h.id,level:'spark',
+          text:'STREAK AT RISK · '+h.name.toUpperCase(),
+          code:h.streak,
+          spoken:`Your ${h.name} streak is at ${h.streak.toLowerCase()} and today isn't marked yet.`});
+      }
+    }
+
+    return out;
+  }
+
+  async function runNudgeCheck(){
+    if(!liveHabits||busy||listening)return;   // don't interrupt a conversation
+    try{
+      const nudges=await evaluateNudges();
+      const order={fire:0,smoke:1,spark:2};
+      nudges.sort((a,b)=>order[a.level]-order[b.level]);
+      const now=Date.now();
+      for(const n of nudges){
+        if(now-(lastNudgeAt[n.id]||0)<NUDGE_COOLDOWN_MS)continue;
+        lastNudgeAt[n.id]=now;
+        showNudge(n);
+        return;   // one at a time — stacked warnings read as nagging
+      }
+    }catch(e){console.error('nudge check failed',e);}
+  }
+
   (async function initSpine(){
     const statusEl=document.getElementById('spineStatus');
     if(!NATIVE){return;} // GitHub Pages / plain browser: stay mock, untouched
@@ -1306,6 +1581,10 @@
       if(demobar)demobar.style.display='none';
       const foot=document.getElementById('foot');
       if(foot)foot.innerHTML='<b>LIVE</b> · PRESS THE CORE AND SPEAK · TAP ANY PANEL TO EXPAND';
+      // Julie starts watching. First check is delayed so the boot sequence
+      // isn't immediately interrupted by a nudge.
+      setTimeout(runNudgeCheck,15000);
+      setInterval(runNudgeCheck,NUDGE_POLL_MS);
     }catch(e){
       console.error('spine connect failed',e);
       if(statusEl)statusEl.textContent='SPINE OFFLINE · DEMO MODE';

@@ -21,7 +21,13 @@ import Speech
 // --wake keeps listening and only reports once it hears the wake word, so the
 // app can run hands-free. Without it, one utterance is captured and we exit.
 let WAKE_MODE = CommandLine.arguments.contains("--wake")
-let WAKE_WORDS = ["jarvis", "jervis", "travis"]  // common mishears of the wake word
+
+// Recognition locale, e.g. en-US or he-IL. Apple ships on-device models for
+// both; availability is checked below and reported rather than failing silently.
+let LOCALE_ID = ProcessInfo.processInfo.environment["JARVIS_LOCALE"] ?? "en-US"
+
+// Common mishears of the wake word, plus Hebrew transliterations.
+let WAKE_WORDS = ["jarvis", "jervis", "travis", "ג'רוויס", "ג'ארוויס"]
 
 let MAX_SECONDS = WAKE_MODE ? 55.0 : 20.0  // SFSpeechRecognizer caps a task ~1min
 let SILENCE_TIMEOUT = 1.7
@@ -66,11 +72,11 @@ guard micAuthorized else {
 
 // ---- recognizer ------------------------------------------------------------
 
-guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
-    fail("no speech recognizer for en-US")
+guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: LOCALE_ID)) else {
+    fail("no speech recognizer for \(LOCALE_ID) — set JARVIS_LOCALE to a supported locale")
 }
 guard recognizer.isAvailable else {
-    fail("speech recognizer unavailable")
+    fail("speech recognizer for \(LOCALE_ID) is unavailable — macOS may still be downloading its model")
 }
 
 let request = SFSpeechAudioBufferRecognitionRequest()
