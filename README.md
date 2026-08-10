@@ -107,19 +107,85 @@ export SDKROOT=$(xcrun --show-sdk-path)
 npm run tauri dev
 ```
 
+This is enough for the UI, the spine data, and habit tracking. **It is
+not enough for voice** — `tauri dev` runs the raw unbundled binary,
+which macOS won't grant microphone access to. For voice, build and run
+the actual `.app`:
+
+```bash
+export SDKROOT=$(xcrun --show-sdk-path)
+npm run tauri build -- --debug
+codesign --force --deep --sign - --entitlements src-tauri/Entitlements.plist \
+  src-tauri/target/debug/bundle/macos/jarvis.app
+export ANTHROPIC_API_KEY=sk-ant-...   # optional — see Voice, below
+./src-tauri/target/debug/bundle/macos/jarvis.app/Contents/MacOS/jarvis
+```
+
+(Launch the binary inside the bundle directly, not `open` — `open`
+won't inherit `ANTHROPIC_API_KEY` from the shell. Ad-hoc signing is
+already set in `tauri.conf.json`, so a plain `tauri build` should
+sign automatically; the manual `codesign` line above is a fallback if
+it doesn't. Every rebuild changes the app's signature, which
+invalidates the previous mic permission grant — macOS will re-prompt
+after each build. That's expected.)
+
+## Voice
+
+Press the center dial (or the mic button) and talk. Speech-to-text is
+fully native and free — a Swift helper
+([`src-tauri/speech/JarvisListen.swift`](src-tauri/speech/JarvisListen.swift))
+using AVAudioEngine + SFSpeechRecognizer, preferring on-device
+recognition when macOS supports it. **This exists because the obvious
+approach — the browser's `webkitSpeechRecognition` — does not work
+inside a Tauri app on macOS.** WKWebView never forwards the permission
+request to macOS's TCC system, so it always fails with `not-allowed`
+and the app never even appears in System Settings → Privacy →
+Microphone. This is an open upstream bug
+([tauri-apps/wry#1195](https://github.com/tauri-apps/wry/issues/1195))
+— the wry maintainers have tried private Apple APIs and haven't
+resolved it. Capturing audio outside the webview is the actual fix,
+not a workaround.
+
+Nav commands ("open focus", "open habits", …) and "remember that
+\<fact\>" (writes straight to `MEMORY.md`) work with zero API cost.
+Open-ended conversation calls Claude and needs `ANTHROPIC_API_KEY`
+(from [console.anthropic.com](https://console.anthropic.com), billed
+separately from any Claude.ai subscription — pay-as-you-go). Without
+it set, conversational replies fail with a clear on-screen error;
+everything else still works.
+
+Replies are spoken with macOS's built-in `say -v Daniel` rather than
+the browser's speech synthesis, which is unreliable once packaged.
+
+A **WAKE ON** button enables hands-free "Jarvis, …" listening. It's a
+hard mute — off actually kills the listener process, not just ignores
+its output.
+
+See [`JARVIS_MASTER.md`](JARVIS_MASTER.md) §9 for the full voice
+architecture and everything above in more detail.
+
 ## Known limitations / in progress
 
 This is an active work-in-progress personal project, not a finished
 product. Specifically, right now:
 
-- **The HUD still runs on mock data, even inside the Tauri app.** The
-  app's window now loads `hud/index.html` directly (`frontendDist` in
-  `tauri.conf.json` points at `../hud`), but that file has no
-  `@tauri-apps/plugin-sql` calls in it — it doesn't read or write the
-  spine at all yet. Every page (Dashboard, Focus, Planner, Projects,
-  Habits, Comms) is still hardcoded JS data. Actually wiring the HUD's
-  JS to `Database.load("sqlite:jarvis.db")` and real queries is the
-  next real step here.
+- **Only Dashboard and Habits are live.** Inside the Tauri app,
+  Dashboard's vitals/energy/ceiling and the Habits page read and write
+  the real spine DB (`hud/index.html`'s `window.__TAURI__` gate — see
+  the bottom of the `<script>` block). Focus, Planner, Projects, and
+  Comms are still hardcoded JS data, and stay that way even in the
+  native app. The GitHub Pages demo is unaffected either way — it has
+  no Tauri backend, so it's 100% mock by design.
+- **`tauri-plugin-sql` only runs pending migrations when something
+  calls `Database.load()` from the frontend.** `002_habits.sql` was
+  applied directly to the local spine DB by hand the first time to
+  unblock testing (it's idempotent, so re-running it via the plugin
+  later is safe) — but a fresh clone of this repo needs the app
+  launched once against a real `Database.load()` call for migrations
+  to actually apply.
+- **The demo state switcher (Blue/Red/Gray) is browser-only now** —
+  it writes mock vitals straight over live DB values, so it's hidden
+  whenever the app is running against the real spine.
 - **The Garmin collector is ~90% done.** It authenticates, pulls body
   battery / stress / sleep, computes an energy forecast, and writes to
   the spine — but the last real attempt got rate-limited by Garmin
@@ -127,17 +193,18 @@ product. Specifically, right now:
   attempt is being rotated (see [Security note](#security-note)). It
   needs one successful manual run with the new password, once Garmin's
   rate limit clears, before it can go back on a schedule.
-- **`habits` / `habit_log` exist in the schema now** (`002_habits.sql`,
-  registered in `src-tauri/src/lib.rs`) but nothing writes to them yet —
-  the Habits page's streaks/weekly grid are still the hardcoded `HABITS`
-  array in `hud/index.html`, not a query. Note also that
-  `tauri-plugin-sql` only runs pending migrations when something calls
-  `Database.load()` from the frontend, which — see above — nothing does
-  yet. `002_habits.sql` was applied directly to the local spine DB by
-  hand to unblock this, since it's idempotent and safe to also run via
-  the plugin later.
+- **Conversation with Jarvis needs `ANTHROPIC_API_KEY`**, deliberately
+  not set up yet (separate cost from any Claude.ai subscription). Nav
+  commands and "remember that…" work without it. See
+  [Voice](#voice), above.
 - **No Notion integration**, despite the HUD referencing it — mocked
   for now.
+- **No tool-calling yet** — Jarvis can talk about your day but can't
+  change anything in it (add a task, mark a habit done by voice
+  outside the Habits page, adjust a deadline). This is the single
+  biggest thing that would make it feel like an actual assistant
+  rather than a chatbot with a nice HUD; see `JARVIS_MASTER.md` §9's
+  closing notes.
 
 ## Security note
 
