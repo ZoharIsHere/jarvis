@@ -2,13 +2,10 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use tauri::{AppHandle, Emitter};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 #[derive(serde::Deserialize)]
 struct AnthropicBlock {
@@ -495,6 +492,87 @@ async fn speak_native(text: String, voice: Option<String>) -> Result<(), String>
     .map_err(|e| format!("speech task failed: {e}"))?
 }
 
+// ---- ambient sensing -------------------------------------------------------
+// JARVIS should know what's happening without being asked. Both of these read
+// existing macOS surfaces rather than pulling in a dependency.
+
+/// Seconds since the last keyboard/mouse input. Drives "you've been at this
+/// for hours" and "are you even here" behavior.
+#[tauri::command]
+fn idle_seconds() -> u64 {
+    let out = Command::new("ioreg")
+        .args(["-c", "IOHIDSystem"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    for line in out.lines() {
+        if !line.contains("HIDIdleTime") {
+            continue;
+        }
+        if let Some(raw) = line.rsplit('=').next() {
+            // Value is in nanoseconds.
+            if let Ok(ns) = raw.trim().trim_matches(|c: char| !c.is_ascii_digit()).parse::<u64>() {
+                return ns / 1_000_000_000;
+            }
+        }
+    }
+    0
+}
+
+/// Name of the frontmost application, for app-usage tracking.
+#[tauri::command]
+fn frontmost_app() -> Option<String> {
+    let out = Command::new("lsappinfo")
+        .arg("front")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+    let asn = out.trim();
+    if asn.is_empty() {
+        return None;
+    }
+    let info = Command::new("lsappinfo")
+        .args(["info", "-only", "name", asn])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+    // Shaped like: "LSDisplayName"="Safari"
+    info.split('=')
+        .nth(1)
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Show and focus the HUD from anywhere.
+fn summon(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        let _ = app.emit("jarvis:summoned", ());
+    }
+}
+
+fn toggle_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        match w.is_visible() {
+            Ok(true) => {
+                let _ = w.hide();
+            }
+            _ => summon(app),
+        }
+    }
+}
+
+#[tauri::command]
+fn hide_window(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -520,8 +598,79 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        // JARVIS is meant to be ambient, not an app you keep re-opening:
+        // closing the window hides it, and the tray icon + global hotkey
+        // summon it back from anywhere.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            let show = MenuItem::with_id(app, "show", "Show JARVIS", true, None::<&str>)?;
+            let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit JARVIS", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("JARVIS")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => summon(app),
+                    "hide" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
+                    }
+                    "quit" => {
+                        WAKE_ON.store(false, std::sync::atomic::Ordering::SeqCst);
+                        stop_speaking();
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                // Left-clicking the menu bar icon toggles the HUD, like Spotlight.
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        toggle_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // Summon from anywhere without touching the mouse.
+            {
+                use tauri_plugin_global_shortcut::{
+                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+                };
+                let hotkey = Shortcut::new(Some(Modifiers::ALT), Code::Space);
+                let h = handle.clone();
+                if let Err(e) = app.global_shortcut().on_shortcut(hotkey, move |_, _, ev| {
+                    if ev.state == ShortcutState::Pressed {
+                        toggle_window(&h);
+                    }
+                }) {
+                    // Another app may already own the combination — not fatal.
+                    eprintln!("could not register ⌥Space: {e}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            greet,
             ask_jarvis,
             listen_once,
             speak_native,
@@ -529,7 +678,10 @@ pub fn run() {
             reset_conversation,
             set_wake_listening,
             llm_status,
-            stop_speaking
+            stop_speaking,
+            idle_seconds,
+            frontmost_app,
+            hide_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

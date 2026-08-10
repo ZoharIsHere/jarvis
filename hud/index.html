@@ -1193,6 +1193,33 @@
       return true;
     }
 
+    // "plan my day" — the scheduler, per JARVIS_MASTER.md §3.3.
+    if(/\b(plan|schedule|rebuild|replan|re-?plan)\b.*\b(my )?(day|today|schedule)\b|\bplan my day\b/.test(t)){
+      try{
+        const blocks=await generatePlan();
+        await loadPlanLive();
+        go('planner');
+        const focus=blocks.filter(b=>b.kind==='focus').length;
+        const msg=`Day planned. ${focus} focus ${focus===1?'block':'blocks'}, hard work on your peak hours.`;
+        toast('✓ PLAN GENERATED · '+focus+' BLOCKS');speak(msg);
+      }catch(e){
+        const m=String(e);
+        toast('✕ PLANNER: '+m);
+        speak(m.includes('forecast')?"I don't have an energy forecast for today yet.":"I couldn't build the plan.");
+      }
+      return true;
+    }
+
+    // "how was my week" — the review, straight from the spine.
+    if(/\b(week|weekly)\b.*\b(review|recap|summary|go|went)\b|\bhow was my week\b/.test(t)){
+      try{
+        const text=await weeklyReview();
+        showTransmission(text.split('\n').join(' · '),'WEEKLY REVIEW','— LAST 7 DAYS');
+        speak(text.split('\n').slice(0,3).join('. '));
+      }catch(e){toast('✕ REVIEW: '+e);}
+      return true;
+    }
+
     // Let Julie answer on demand rather than only when she fires on her own.
     if(/\b(how am i|how'?s my|status|check my|am i ok|am i overdoing)\b/.test(t)){
       const nudges=await evaluateNudges();
@@ -1317,7 +1344,12 @@
   document.addEventListener('keydown',e=>{
     if(e.key==='1')go('dashboard');if(e.key==='2')go('focus');if(e.key==='3')go('planner');if(e.key==='4')go('projects');if(e.key==='5')go('habits');if(e.key==='6')go('comms');
     if(e.code==='Space'&&current==='dashboard'){e.preventDefault();busy?(clearTimeout(hideTimer),hideLine()):showLine();}
-    if(e.key==='Escape')go('dashboard');
+    // Esc behaves like Spotlight: back out to the dashboard first, then
+    // dismiss the HUD entirely. It stays running in the menu bar.
+    if(e.key==='Escape'){
+      if(current!=='dashboard'){go('dashboard');}
+      else if(NATIVE){window.__TAURI__.core.invoke('hide_window').catch(()=>{});}
+    }
   });
 
   // ==========================================================
@@ -1567,6 +1599,229 @@
     }catch(e){console.error('nudge check failed',e);}
   }
 
+  // ==========================================================
+  // DAY PLANNER — turns tasks + deadlines + the energy curve into an
+  // hour-by-hour plan (JARVIS_MASTER.md §3.3b).
+  //
+  // Deliberately plain code: the doc's own split puts the scheduler in
+  // "mostly code", reserving AI for parsing brain-dumps and phrasing the
+  // first move. So this runs with no API key.
+  //
+  // Constraints honored: hard work at energy peaks, the 5h study ceiling,
+  // ~30% buffer, Friday dinner is untouchable, and deadlines are back-planned
+  // so the nearest one gets the best slot.
+  // ==========================================================
+  const PLAN_DAY_START=9, PLAN_DAY_END=24;   // hours JARVIS is willing to schedule
+  const BLOCK_MIN=50, BREAK_MIN=10;          // pomodoro-ish; the break is the buffer
+
+  const hhmm=(h,m)=>String(h).padStart(2,'0')+':'+String(m||0).padStart(2,'0');
+
+  // Venue follows energy: peak hours deserve the place with the least friction.
+  function venueFor(energy,isPeak){
+    if(isPeak)return 'deep work · home desk';
+    if(energy>=60)return 'library';
+    if(energy>=40)return "father's office";
+    return 'home · light only';
+  }
+
+  async function generatePlan(dateStr){
+    const date=dateStr||fmtDate(new Date());
+    const d=new Date(date+'T00:00:00');
+    const isFriday=d.getDay()===5;
+
+    const s=await loadSettings();
+    const ceilingHours=num(s,'study_ceiling_hours',5);
+    const dinnerStart=(s['friday_dinner_start']||'19:45');
+    const dinnerEnd=(s['friday_dinner_end']||'21:15');
+
+    const fc=await dbSelect(
+      'SELECT hour,energy,is_peak FROM energy_forecast WHERE date=(SELECT MAX(date) FROM energy_forecast) ORDER BY hour');
+    if(!fc||!fc.length)throw new Error('no energy forecast — run garmin_collector.py');
+    const byHour={};fc.forEach(r=>{byHour[r.hour]=r;});
+
+    // Deadlines first: nearest due date is most urgent, and its tasks earn the
+    // best remaining slot. Tasks with no deadline fill in afterwards.
+    const deadlines=await dbSelect(
+      "SELECT id,title,due,severity FROM deadlines WHERE status='open' ORDER BY due ASC");
+    const tasks=await dbSelect(
+      "SELECT id,title,type,deadline_id,size,first_move,venue_pref FROM tasks WHERE status='pending'");
+
+    const urgency={};deadlines.forEach((dl,i)=>{urgency[dl.id]=i;});
+    const ranked=tasks.slice().sort((a,b)=>{
+      const ua=a.deadline_id!=null?urgency[a.deadline_id]??999:999;
+      const ub=b.deadline_id!=null?urgency[b.deadline_id]??999:999;
+      if(ua!==ub)return ua-ub;
+      return (b.size||1)-(a.size||1);   // bigger tasks get first pick of peaks
+    });
+
+    // Build candidate slots, best-energy first, so the hardest work lands on
+    // the best hours regardless of where they fall in the day.
+    const slots=[];
+    for(let h=PLAN_DAY_START;h<PLAN_DAY_END;h++){
+      const hour=h%24, f=byHour[hour];
+      if(!f)continue;
+      if(isFriday){
+        const ds=parseInt(dinnerStart.split(':')[0],10);
+        const de=parseInt(dinnerEnd.split(':')[0],10);
+        if(hour>=ds&&hour<=de)continue;   // family dinner is not negotiable
+      }
+      slots.push({hour,energy:f.energy,isPeak:!!f.is_peak});
+    }
+    slots.sort((a,b)=>(b.isPeak?1:0)-(a.isPeak?1:0)||b.energy-a.energy);
+
+    const maxBlocks=Math.max(1,Math.floor((ceilingHours*60)/(BLOCK_MIN+BREAK_MIN)));
+    const chosen=slots.slice(0,Math.min(maxBlocks,ranked.length||maxBlocks));
+    chosen.sort((a,b)=>a.hour-b.hour);    // back to chronological for display
+
+    const blocks=[];
+    chosen.forEach((slot,i)=>{
+      const t=ranked[i];
+      blocks.push({
+        start:hhmm(slot.hour,0),
+        end:hhmm(slot.hour,BLOCK_MIN),
+        task_id:t?t.id:null,
+        label:t?t.title:(slot.isPeak?'Deep work · peak':'Focus block'),
+        kind:'focus',
+        venue:t&&t.venue_pref?t.venue_pref:venueFor(slot.energy,slot.isPeak),
+        // The "stupidly small first move" — a stored one wins; otherwise a
+        // deliberately trivial default, because starting is the hard part.
+        first_move:(t&&t.first_move)||'Open the file and read one line.',
+        is_protected:0,
+      });
+      blocks.push({
+        start:hhmm(slot.hour,BLOCK_MIN),
+        end:hhmm(slot.hour+1,0),
+        task_id:null,label:'Break',kind:'break',venue:null,first_move:null,is_protected:0,
+      });
+    });
+
+    if(isFriday){
+      blocks.push({start:dinnerStart,end:dinnerEnd,task_id:null,
+        label:'Family dinner',kind:'protected',venue:'home',
+        first_move:null,is_protected:1});
+    }
+    blocks.sort((a,b)=>a.start.localeCompare(b.start));
+
+    // Replace only the generated blocks — anything the user protected stays.
+    await dbExecute('DELETE FROM plan_blocks WHERE date=$1 AND is_protected=0',[date]);
+    for(const b of blocks){
+      await dbExecute(
+        'INSERT INTO plan_blocks (date,start,end,task_id,label,kind,venue,first_move,status,is_protected) '+
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'scheduled',$9)",
+        [date,b.start,b.end,b.task_id,b.label,b.kind,b.venue,b.first_move,b.is_protected]);
+    }
+    return blocks;
+  }
+
+  async function loadPlanLive(){
+    const date=fmtDate(new Date());
+    const rows=await dbSelect(
+      'SELECT start,end,label,kind,venue,first_move,status,is_protected FROM plan_blocks WHERE date=$1 ORDER BY start',[date]);
+    if(!rows||!rows.length)return false;
+    const nowHM=hhmm(new Date().getHours(),new Date().getMinutes());
+    document.getElementById('timeline').innerHTML=rows.map(b=>{
+      const live=b.start<=nowHM&&nowHM<b.end;
+      const cls=b.is_protected||b.kind==='protected'?'prot':live?'now':'';
+      const meta=[b.venue,b.first_move?'▸ '+b.first_move:null].filter(Boolean).join(' · ');
+      return `<div class="block ${cls}"><div class="bt">${esc(b.start)}</div><div class="bbar"></div>`+
+             `<div><div class="btitle">${esc(b.label)}</div><div class="bmeta">${esc(meta)}</div></div></div>`;
+    }).join('');
+    const sub=document.querySelector('#page-planner .pg-sub');
+    if(sub)sub.innerHTML='LIVE · SPINE DB · '+rows.length+' BLOCKS';
+    return true;
+  }
+
+  // ==========================================================
+  // WEEKLY REVIEW — what actually happened, from the spine
+  // ==========================================================
+  async function weeklyReview(){
+    const since=new Date();since.setDate(since.getDate()-7);
+    const from=fmtDate(since);
+    const [habits,usage,blocks,checks]=await Promise.all([
+      dbSelect('SELECT h.name,COUNT(*) AS n FROM habit_log l JOIN habits h ON h.id=l.habit_id '+
+               'WHERE l.done=1 AND l.date>=$1 GROUP BY h.name ORDER BY n DESC',[from]),
+      dbSelect('SELECT app,SUM(minutes) AS m FROM app_usage WHERE date>=$1 GROUP BY app ORDER BY m DESC LIMIT 5',[from]),
+      dbSelect("SELECT COUNT(*) AS n FROM plan_blocks WHERE date>=$1 AND status='done'",[from]),
+      dbSelect('SELECT AVG(fuel) AS f,COUNT(*) AS n FROM checkins WHERE ts>=$1',[from+' 00:00:00']),
+    ]);
+    const lines=[];
+    lines.push(`Week of ${from} →`);
+    if(habits.length)lines.push('Habits: '+habits.map(h=>`${h.name} ${h.n}/7`).join(' · '));
+    if(blocks&&blocks[0])lines.push(`Focus blocks completed: ${blocks[0].n}`);
+    if(usage.length)lines.push('Most-used: '+usage.map(u=>`${u.app} ${Math.round(u.m/60*10)/10}h`).join(' · '));
+    if(checks&&checks[0]&&checks[0].n)lines.push(`Avg self-reported fuel: ${(checks[0].f||0).toFixed(1)}/4 over ${checks[0].n} check-ins`);
+    if(lines.length===1)lines.push('Not enough logged yet for a useful review.');
+    return lines.join('\n');
+  }
+
+  // ==========================================================
+  // AMBIENT SENSING — what's happening without being asked
+  //
+  // Samples the frontmost app on an interval and accumulates minutes into
+  // `app_usage`, tagged with whether a focus block was running at the time.
+  // That's the input the energy model and the anti-burnout monitor need to
+  // tell "three hours of work" from "three hours of YouTube".
+  // ==========================================================
+  const USAGE_SAMPLE_MS=60000;
+  const IDLE_THRESHOLD_S=180;   // 3 min of no input = not at the desk
+  let lastActiveNudge=0;
+
+  async function inFocusBlock(){
+    try{
+      const r=await dbSelect("SELECT value FROM state_flags WHERE key='active_focus_block_id'");
+      return !!(r&&r[0]&&r[0].value);
+    }catch(e){return false;}
+  }
+
+  async function sampleUsage(){
+    if(!liveHabits)return;
+    try{
+      const idle=await window.__TAURI__.core.invoke('idle_seconds');
+      // Don't credit time to an app the user isn't actually using.
+      if(idle>IDLE_THRESHOLD_S)return;
+
+      const app=await window.__TAURI__.core.invoke('frontmost_app');
+      if(!app)return;
+      const date=fmtDate(new Date());
+      const during=(await inFocusBlock())?1:0;
+
+      // One row per app per day per focus-state; minutes accumulate.
+      const existing=await dbSelect(
+        'SELECT id,minutes FROM app_usage WHERE date=$1 AND app=$2 AND during_focus=$3 LIMIT 1',
+        [date,app,during]);
+      if(existing&&existing[0]){
+        await dbExecute('UPDATE app_usage SET minutes=$1 WHERE id=$2',
+          [(existing[0].minutes||0)+1,existing[0].id]);
+      }else{
+        await dbExecute(
+          'INSERT INTO app_usage (date,app,minutes,during_focus) VALUES ($1,$2,1,$3)',
+          [date,app,during]);
+      }
+    }catch(e){console.error('usage sample failed',e);}
+  }
+
+  // "You've been at this a while" — based on real input activity, not a timer
+  // that keeps counting while you're away from the desk.
+  async function checkSustainedActivity(){
+    if(!liveHabits||busy||listening)return;
+    try{
+      const idle=await window.__TAURI__.core.invoke('idle_seconds');
+      if(idle>IDLE_THRESHOLD_S)return;
+      const date=fmtDate(new Date());
+      const r=await dbSelect(
+        'SELECT SUM(minutes) AS m FROM app_usage WHERE date=$1 AND during_focus=1',[date]);
+      const mins=(r&&r[0]&&r[0].m)||0;
+      const now=Date.now();
+      if(mins>=180&&now-lastActiveNudge>90*60*1000){
+        lastActiveNudge=now;
+        showNudge({id:'sustained_focus',level:'smoke',
+          text:'THREE HOURS OF FOCUSED WORK · CONSIDER A BREAK',
+          code:`${Math.round(mins/60*10)/10}H TODAY`,
+          spoken:"You've been heads-down for about three hours. A break now is cheaper than a crash later."});
+      }
+    }catch(e){console.error('activity check failed',e);}
+  }
+
   (async function initSpine(){
     const statusEl=document.getElementById('spineStatus');
     if(!NATIVE){return;} // GitHub Pages / plain browser: stay mock, untouched
@@ -1574,17 +1829,29 @@
       await window.__TAURI__.core.invoke('plugin:sql|load',{db:SPINE_DB});
       await loadDashboardLive();
       await loadHabitsLive();
+      await loadPlanLive().catch(()=>{});   // mock timeline stays if no plan exists yet
       if(statusEl)statusEl.textContent='SPINE ONLINE · LIVE';
       // The demo state switcher writes mock vitals straight over live DB values,
       // so it only belongs in the browser demo.
       const demobar=document.getElementById('demobar');
       if(demobar)demobar.style.display='none';
       const foot=document.getElementById('foot');
-      if(foot)foot.innerHTML='<b>LIVE</b> · PRESS THE CORE AND SPEAK · TAP ANY PANEL TO EXPAND';
+      if(foot)foot.innerHTML='<b>LIVE</b> · PRESS THE CORE AND SPEAK · <b>⌥SPACE</b> SUMMONS · <b>ESC</b> HIDES';
       // Julie starts watching. First check is delayed so the boot sequence
       // isn't immediately interrupted by a nudge.
       setTimeout(runNudgeCheck,15000);
       setInterval(runNudgeCheck,NUDGE_POLL_MS);
+      // Ambient sensing runs whether or not the window is visible — the whole
+      // point is that JARVIS keeps watching after you close the HUD.
+      setInterval(sampleUsage,USAGE_SAMPLE_MS);
+      setInterval(checkSustainedActivity,5*60*1000);
+      // ⌥Space or the menu-bar icon re-summons; refresh so it isn't stale.
+      if(window.__TAURI__.event){
+        window.__TAURI__.event.listen('jarvis:summoned',()=>{
+          loadDashboardLive().catch(()=>{});
+          loadHabitsLive().catch(()=>{});
+        });
+      }
     }catch(e){
       console.error('spine connect failed',e);
       if(statusEl)statusEl.textContent='SPINE OFFLINE · DEMO MODE';
