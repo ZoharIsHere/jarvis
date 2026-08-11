@@ -10,17 +10,18 @@ Ordered by what unblocks the most.
 
 ## 🔴 Do first — security
 
-### 1. Rotate the Garmin password
-Still outstanding from the very first task. The HUD's own demo data records it
-as *"Exposed in terminal + chat"*. Nothing in this repo contains it, but it
-leaked somewhere.
-→ Garmin Connect → Account Settings → change password.
+### 1. Garmin password
+→ Garmin Connect → Account Settings → change password, then re-run the
+collector once so a token gets cached.
 **Unblocks:** the Garmin collector, which unblocks Julie's real vitals
 (currently NULL, so she runs on self-reported check-ins only).
 
-### 2. Rotate the Notion integration token
-Same story — an `ntn_...` token was exposed outside the repo.
+### 2. Notion integration token
 → notion.so/my-integrations → your integration → **Refresh** the secret.
+
+*(Context for both: credentials passed through a terminal/chat session during
+development, outside this repo — see the Security note in the README. Neither
+was ever committed here.)*
 
 ---
 
