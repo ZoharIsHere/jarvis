@@ -925,6 +925,39 @@ fn frontmost_app() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Append a line to a trace log next to the spine.
+///
+/// The webview's console isn't reachable from outside the app, so a voice
+/// command that vanishes leaves no evidence. This gives it somewhere to land.
+#[tauri::command]
+fn trace(msg: String) {
+    use std::io::Write;
+    let dir = memory_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = Command::new("date")
+        .args(["+%H:%M:%S"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("trace.log"))
+    {
+        let _ = writeln!(f, "{stamp}  {msg}");
+    }
+}
+
+/// Open the webview inspector so console errors are visible.
+#[tauri::command]
+fn open_devtools(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        w.open_devtools();
+    }
+}
+
 /// Post a real macOS notification.
 ///
 /// The HUD now hides rather than quits, so a nudge shown only inside the HUD
@@ -1207,7 +1240,9 @@ pub fn run() {
             diagnostics,
             set_secret,
             secret_status,
-            cancel_listening
+            cancel_listening,
+            trace,
+            open_devtools
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

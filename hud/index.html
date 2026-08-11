@@ -686,6 +686,19 @@
 <script>
   const NATIVE=!!(window.__TAURI__&&window.__TAURI__.core);
   if(NATIVE){document.body.classList.add('native');}
+  // Catch-all diagnostics, installed first so it sees everything after it.
+  // initSpine runs at the very end of this script, so a top-level throw
+  // anywhere above it silently skips startup while leaving already-attached
+  // event listeners working — which looks like "the app runs but knows
+  // nothing". Without this there is no way to see that from outside.
+  if(NATIVE){
+    const _t=m=>{try{window.__TAURI__.core.invoke('trace',{msg:String(m)}).catch(()=>{});}catch(e){}};
+    window.addEventListener('error',e=>
+      _t(`!! JS ERROR: ${e.message} @${(e.filename||'').split('/').pop()}:${e.lineno}:${e.colno}`));
+    window.addEventListener('unhandledrejection',e=>
+      _t(`!! UNHANDLED REJECTION: ${e.reason}`));
+    _t('--- HUD script start ---');
+  }
   // Anything from the DB or the model gets escaped before it touches innerHTML.
   const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const C=600,M=400,P2=Math.PI*2;
@@ -1189,8 +1202,11 @@
       return;
     }
     const {tier,why}=classifyDifficulty(text);
-    const s=await loadSettings();
+    let s={};
+    try{ s=await loadSettings(); }
+    catch(e){ trace('  loadSettings failed: '+e); }
     const localEnabled=(s['llm_local_enabled']||'1')!=='0';
+    trace(`  tier=${tier} (${why}) localEnabled=${localEnabled}`);
     // Fall through to cloud if local is switched off.
     const useTier=(tier<3&&!localEnabled)?3:tier;
 
@@ -1218,8 +1234,10 @@
     try{
       // Only the cloud tier gets spine context — see ask_jarvis for why.
       const context=useTier===3?await buildSpineContext():null;
+      trace(`  calling ask_jarvis tier=${useTier}`);
       const r=await window.__TAURI__.core.invoke('ask_jarvis',
         {prompt:text,context,tier:useTier,models:await tierModels()});
+      trace(`  ← ${r.provider}/${r.model} ${r.latency_ms}ms`);
       const short=text.length>40?text.slice(0,40)+'…':text;
       const tag=r.provider==='ollama'?`— LOCAL · ${r.model} · ${Math.round((r.latency_ms||0)/100)/10}s`
                                      :`— IN REPLY TO "${short.toUpperCase()}"`;
@@ -1230,6 +1248,7 @@
       speak(r.text,{onend:maybeContinue});
     }catch(e){
       const msg=String(e);
+      trace('  !! ask_jarvis failed: '+msg);
       logLlmCall({tier:useTier,provider:useTier<3?'ollama':'anthropic'},false,false,msg);
       // Every failure gets spoken. A silent failure is indistinguishable from
       // being ignored — which is exactly what made this hard to place.
@@ -1474,11 +1493,20 @@
       /^(what|who|when|where|why|how|which|can you|could you|do you|is there|are there|tell me|explain|describe|give me)\b/.test(t.trim());
   }
 
+  // Writes to trace.log beside the spine. The webview console can't be read
+  // from outside the app, so without this a command that vanishes leaves no
+  // evidence at all.
+  function trace(msg){
+    try{ if(NATIVE)window.__TAURI__.core.invoke('trace',{msg:String(msg)}).catch(()=>{}); }catch(e){}
+  }
+
   async function handleCommand(text){
     const t=text.toLowerCase();
-    if(/wake up|daddy|power on|boot/i.test(t)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');return;}
+    trace(`HEARD: "${text}"`);
+    if(/wake up|daddy|power on|boot/i.test(t)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');trace('→ boot sequence');return;}
 
     const question=looksLikeQuestion(t);
+    trace(`  question=${question} liveHabits=${liveHabits} native=${NATIVE}`);
 
     // State-changing commands take precedence over navigation, so "mark focus
     // done" logs a habit instead of just opening the Focus page. Questions
@@ -1499,10 +1527,11 @@
 
     if(!question){
       const pg=navTarget(t);
-      if(pg){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}
-      if(/\b(quote|julie|motivat\w*)\b/.test(t)){go('dashboard');showLine();toast('▸ JULIE');return;}
+      if(pg){go(pg);toast('▸ OPENING '+pg.toUpperCase());trace('→ nav '+pg);return;}
+      if(/\b(quote|julie|motivat\w*)\b/.test(t)){go('dashboard');showLine();toast('▸ JULIE');trace('→ julie quote');return;}
     }
-    askJarvisConversation(text);
+    trace('→ conversation');
+    await askJarvisConversation(text);
   }
 
   // Native listener (desktop app). The webview's Web Speech API can't get mic
@@ -1549,10 +1578,18 @@
       const text=await window.__TAURI__.core.invoke('listen_once');
       setListeningUI(false);
       restoreCoreIdle();
-      if(text)handleCommand(text);
+      // handleCommand is async; without this catch any exception inside it
+      // becomes an unhandled rejection and the turn ends in total silence —
+      // indistinguishable from being ignored.
+      if(text)handleCommand(text).catch(err=>{
+        trace('!! handleCommand threw: '+err+(err&&err.stack?' | '+err.stack:''));
+        toast('✕ ERROR: '+err);
+        speak("Something went wrong handling that.");
+      });
     }catch(e){
       setListeningUI(false);
       restoreCoreIdle();
+      trace('!! listen failed: '+e);
       toast('✕ MIC: '+e);
     }finally{
       if(resumeWake)setWake(true,true);
@@ -1720,12 +1757,20 @@
   const lastNudgeAt={};
   let settingsCache=null;
 
+  // Never throws. Settings are tuning values with sane defaults, so a spine
+  // that isn't up should degrade behaviour, not take the whole turn down with
+  // it — local answers need no database at all.
   async function loadSettings(){
     if(settingsCache)return settingsCache;
-    const rows=await dbSelect('SELECT key,value FROM settings');
-    settingsCache={};
-    rows.forEach(r=>{settingsCache[r.key]=r.value;});
-    return settingsCache;
+    try{
+      const rows=await dbSelect('SELECT key,value FROM settings');
+      const out={};
+      rows.forEach(r=>{out[r.key]=r.value;});
+      settingsCache=out;          // only cache a real read
+      return out;
+    }catch(e){
+      return {};                  // uncached, so it retries once the spine is up
+    }
   }
   const num=(s,k,d)=>{const v=parseFloat(s[k]);return isNaN(v)?d:v;};
 
@@ -2265,9 +2310,13 @@
     const statusEl=document.getElementById('spineStatus');
     if(!NATIVE){return;} // GitHub Pages / plain browser: stay mock, untouched
     try{
+      trace('initSpine: loading '+SPINE_DB);
       await window.__TAURI__.core.invoke('plugin:sql|load',{db:SPINE_DB});
+      trace('initSpine: load OK');
       await loadDashboardLive();
+      trace('initSpine: dashboard OK');
       await loadHabitsLive();
+      trace('initSpine: habits OK, liveHabits='+liveHabits);
       await loadPlanLive().catch(()=>{});   // mock timeline stays if no plan exists yet
       continuousVoice=((await loadSettings())['voice_continuous']||'0')==='1';
       if(statusEl)statusEl.textContent='SPINE ONLINE · LIVE';
@@ -2298,6 +2347,7 @@
       }
     }catch(e){
       console.error('spine connect failed',e);
+      trace('!! initSpine FAILED: '+e+(e&&e.stack?' | '+e.stack:''));
       if(statusEl)statusEl.textContent='SPINE OFFLINE · DEMO MODE';
     }
   })();
