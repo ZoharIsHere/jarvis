@@ -1423,19 +1423,31 @@
   // permission on macOS — see src-tauri/speech/JarvisListen.swift — so the app
   // shells out to a native AVFoundation helper instead. Browser keeps using
   // webkitSpeechRecognition, which works fine there.
-  // After JARVIS answers, reopen the mic once so a follow-up doesn't need
-  // another press. The native helper exits on silence, so saying nothing
-  // simply ends the exchange — no timer to get wrong, no runaway loop.
-  let continueChain=0;
+  // After JARVIS answers, optionally reopen the mic so a follow-up doesn't
+  // need another press.
+  //
+  // Off by default, deliberately. When it was on, the mic would silently
+  // reopen after a reply and the next core press became a no-op — which read
+  // as JARVIS having gone deaf. Opt in with:
+  //   UPDATE settings SET value='1' WHERE key='voice_continuous';
+  let continueChain=0, continuousVoice=false;
   const MAX_CHAIN=6;
   function maybeContinue(){
-    if(!NATIVE||continueChain>=MAX_CHAIN)  {continueChain=0;return;}
+    if(!NATIVE||!continuousVoice||continueChain>=MAX_CHAIN){continueChain=0;return;}
     continueChain++;
     setTimeout(()=>{ if(!listening&&!busy)listenNative(true); },600);
   }
 
   async function listenNative(isFollowUp){
-    if(listening)return;
+    // A press while already listening cancels, rather than silently doing
+    // nothing. Silent no-ops are indistinguishable from a crash.
+    if(listening){
+      try{await window.__TAURI__.core.invoke('cancel_listening');}catch(e){}
+      setListeningUI(false);
+      restoreCoreIdle();
+      toast('◦ CANCELLED');
+      return;
+    }
     if(!isFollowUp)continueChain=0;   // a deliberate press starts a fresh chain
     // Barge-in: talking over JARVIS cuts him off instead of queueing behind him.
     window.__TAURI__.core.invoke('stop_speaking').catch(()=>{});
@@ -2171,6 +2183,7 @@
       await loadDashboardLive();
       await loadHabitsLive();
       await loadPlanLive().catch(()=>{});   // mock timeline stays if no plan exists yet
+      continuousVoice=((await loadSettings())['voice_continuous']||'0')==='1';
       if(statusEl)statusEl.textContent='SPINE ONLINE · LIVE';
       // The demo state switcher writes mock vitals straight over live DB values,
       // so it only belongs in the browser demo.

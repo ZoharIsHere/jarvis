@@ -29,4 +29,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
   ('llm_tier2_model',   'qwen2.5:1.5b'),
   ('llm_local_enabled', '1'),
   -- Hard ceiling so an agent loop can't quietly spend a fortune.
-  ('llm_daily_budget_usd', '0.50');
+  ('llm_daily_budget_usd', '0.50'),
+  -- Off by default: auto-reopening the mic after a reply made the next core
+  -- press a silent no-op, which reads as the app having gone deaf.
+  ('voice_continuous', '0');

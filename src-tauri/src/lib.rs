@@ -516,10 +516,28 @@ fn speech_helper_path() -> Option<PathBuf> {
 /// webview's Web Speech API, which never reaches macOS's permission system
 /// (tauri-apps/wry#1195). Partial transcripts stream to the UI as
 /// `jarvis:partial` events while the user is still speaking.
+/// The in-flight speech helper, so a listen can be cancelled.
+static LISTENER: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+/// Stop an in-progress listen. Pressing the core while it's already listening
+/// used to be a silent no-op, which read as the app being dead.
+#[tauri::command]
+fn cancel_listening() {
+    if let Ok(mut guard) = LISTENER.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[tauri::command]
 async fn listen_once(app: AppHandle) -> Result<String, String> {
     let helper = speech_helper_path()
         .ok_or_else(|| "speech helper not found — rebuild the app".to_string())?;
+
+    // Never run two listeners at once — they'd fight over the microphone.
+    cancel_listening();
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut child = Command::new(&helper)
@@ -532,6 +550,10 @@ async fn listen_once(app: AppHandle) -> Result<String, String> {
             .stdout
             .take()
             .ok_or_else(|| "speech helper produced no output".to_string())?;
+
+        if let Ok(mut guard) = LISTENER.lock() {
+            *guard = Some(child);
+        }
 
         let mut final_text = String::new();
         let mut error: Option<String> = None;
@@ -561,7 +583,13 @@ async fn listen_once(app: AppHandle) -> Result<String, String> {
             }
         }
 
-        let _ = child.wait();
+        // The child is owned by LISTENER now; reap and clear it there so a
+        // later cancel_listening() can't kill an unrelated process.
+        if let Ok(mut guard) = LISTENER.lock() {
+            if let Some(mut c) = guard.take() {
+                let _ = c.wait();
+            }
+        }
 
         if let Some(e) = error {
             return Err(e);
@@ -1178,7 +1206,8 @@ pub fn run() {
             run_garmin_collector,
             diagnostics,
             set_secret,
-            secret_status
+            secret_status,
+            cancel_listening
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
