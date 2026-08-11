@@ -29,8 +29,13 @@ let LOCALE_ID = ProcessInfo.processInfo.environment["JARVIS_LOCALE"] ?? "en-US"
 // Common mishears of the wake word, plus Hebrew transliterations.
 let WAKE_WORDS = ["jarvis", "jervis", "travis", "ג'רוויס", "ג'ארוויס"]
 
-let MAX_SECONDS = WAKE_MODE ? 55.0 : 20.0  // SFSpeechRecognizer caps a task ~1min
-let SILENCE_TIMEOUT = 1.7
+let MAX_SECONDS = WAKE_MODE ? 55.0 : 30.0  // SFSpeechRecognizer caps a task ~1min
+
+// How long a pause ends the utterance. 1.7s cut people off mid-thought — a
+// natural pause before the second half of a sentence is longer than that, and
+// being truncated reads as bad recognition rather than an impatient timeout.
+let SILENCE_TIMEOUT =
+    Double(ProcessInfo.processInfo.environment["JARVIS_SILENCE_TIMEOUT"] ?? "") ?? 2.6
 
 func emit(_ dict: [String: String]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -81,9 +86,43 @@ guard recognizer.isAvailable else {
 
 let request = SFSpeechAudioBufferRecognitionRequest()
 request.shouldReportPartialResults = true
-// Keep audio on the machine when the OS can do it locally.
-if recognizer.supportsOnDeviceRecognition {
+
+// Accuracy vs privacy, and the default is deliberate.
+//
+// Apple's on-device model is noticeably weaker than their server model —
+// enough that it was the main source of mis-transcriptions. Server
+// recognition is the default so dictation is actually usable; set
+// JARVIS_STT_ONDEVICE=1 to keep audio on the machine at the cost of accuracy.
+//
+// Note this is the only part of the voice path that can leave the device, and
+// only when this is off. Wake-word listening still runs on-device (see below).
+let forceOnDevice = ProcessInfo.processInfo.environment["JARVIS_STT_ONDEVICE"] == "1"
+if recognizer.supportsOnDeviceRecognition && (forceOnDevice || WAKE_MODE) {
+    // Wake mode listens continuously, so it always stays local regardless.
     request.requiresOnDeviceRecognition = true
+}
+
+// Free accuracy, no privacy cost: tell the recognizer which words to expect.
+// Proper nouns and jargon are exactly what a general model gets wrong.
+request.contextualStrings = [
+    "Jarvis", "Julie", "Zohar",
+    // navigation
+    "dashboard", "focus", "planner", "projects", "habits", "comms",
+    // habits, as seeded in 002_habits.sql
+    "Run", "Study", "Guitar", "Novel", "phone in bed",
+    // commands that must land exactly
+    "plan my day", "how was my week", "back up the spine", "status",
+    "remember that", "start focus", "check in",
+    // domain vocabulary from his actual coursework
+    "Infi", "Yahadut", "Bar-Ilan", "recursion", "linked lists",
+    // the model's own vocabulary
+    "body battery", "streak", "ceiling", "deadline", "fuel", "Garmin",
+]
+
+// Dictation tuning: full sentences rather than short search queries.
+request.taskHint = .dictation
+if #available(macOS 13.0, *) {
+    request.addsPunctuation = true
 }
 
 let engine = AVAudioEngine()
