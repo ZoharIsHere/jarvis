@@ -1309,7 +1309,9 @@
              : /\b(i'?m |i am |feeling )?(ok|okay|fine|alright)\b/.test(t) ? 3
              : /\b(i'?m |i am |feeling )?(good|solid|strong|great|sharp)\b/.test(t) ? 4
              : null;
-    if(fuel!==null&&/\b(i'?m|i am|feeling|check ?in|fuel)\b/.test(t)){
+    // Short statements only. "I'm good" is a check-in; "I'm trying to find a
+    // good way to study" is not, and treating it as one swallowed the request.
+    if(fuel!==null&&/\b(i'?m|i am|feeling|check ?in|fuel)\b/.test(t)&&t.split(/\s+/).length<=6){
       try{
         await dbExecute('INSERT INTO checkins (fuel) VALUES ($1)',[fuel]);
         await logEnergySample(fuel);   // labelled sample for the learning loop
@@ -1440,18 +1442,66 @@
 
   // Nav keywords are matched case-insensitively, but the LLM gets the original
   // casing — lowercasing everything made for noticeably worse prompts.
+  // Navigation used to be a substring scan, which quietly ate ordinary
+  // sentences: "comm" matched "recommend", "main" matched "remain", "home"
+  // matched "homework". Asking "can you recommend a study method" switched to
+  // the Comms page and dropped the question, which is indistinguishable from
+  // being ignored.
+  //
+  // Now navigation must actually look like navigation: an explicit verb
+  // ("open habits"), or an utterance that is essentially just the page name.
+  const NAV_PAGES=[
+    [/\bfocus\b/,'focus'],
+    [/\b(planner|plan)\b/,'planner'],
+    [/\bprojects?\b/,'projects'],
+    [/\bhabits?\b/,'habits'],
+    [/\b(comms?|soundboard|messages)\b/,'comms'],
+    [/\b(dashboard|home|main)\b/,'dashboard'],
+  ];
+  const NAV_VERB_RE=/\b(open|go to|goto|show|switch to|take me to|bring up|navigate to)\b/;
+
+  function navTarget(t){
+    const words=t.trim().split(/\s+/).length;
+    // Either an explicit navigation verb, or a bare page name.
+    if(!NAV_VERB_RE.test(t)&&words>3)return null;
+    for(const [re,pg] of NAV_PAGES){ if(re.test(t))return pg; }
+    return null;
+  }
+
+  // Questions are for answering, not for triggering side effects.
+  function looksLikeQuestion(t){
+    return /\?\s*$/.test(t)||
+      /^(what|who|when|where|why|how|which|can you|could you|do you|is there|are there|tell me|explain|describe|give me)\b/.test(t.trim());
+  }
+
   async function handleCommand(text){
     const t=text.toLowerCase();
     if(/wake up|daddy|power on|boot/i.test(t)){go('comms');runBoot();toast('▸ POWER-ON SEQUENCE');return;}
+
+    const question=looksLikeQuestion(t);
+
     // State-changing commands take precedence over navigation, so "mark focus
-    // done" logs a habit instead of just opening the Focus page.
-    if(NATIVE&&liveHabits){
+    // done" logs a habit instead of just opening the Focus page. Questions
+    // skip this entirely — "what's a good way to run faster" is not a request
+    // to mark the Run habit done.
+    if(NATIVE&&liveHabits&&!question){
       try{ if(await tryActionCommand(text))return; }
       catch(e){console.error('action command failed',e);}
     }
-    const map=[['focus','focus'],['plan','planner'],['project','projects'],['habit','habits'],['comm','comms'],['soundboard','comms'],['dashboard','dashboard'],['home','dashboard'],['main','dashboard']];
-    for(const [kw,pg] of map){if(t.includes(kw)){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}}
-    if(t.includes('quote')||t.includes('julie')||t.includes('motivat')){go('dashboard');showLine();toast('▸ JULIE');return;}
+    // Plenty of real commands are phrased as questions — "can you plan my
+    // day", "how was my week". Those must still run rather than being sent
+    // off to the model.
+    if(NATIVE&&liveHabits&&question&&
+       /\b(how am i|how'?s my|how was my week|status|diagnostic|self ?check|what'?s broken|what was i (doing|working on)|plan my (day|week)|back ?up|remember that|save my api key)\b/.test(t)){
+      try{ if(await tryActionCommand(text))return; }
+      catch(e){console.error('action command failed',e);}
+    }
+
+    if(!question){
+      const pg=navTarget(t);
+      if(pg){go(pg);toast('▸ OPENING '+pg.toUpperCase());return;}
+      if(/\b(quote|julie|motivat\w*)\b/.test(t)){go('dashboard');showLine();toast('▸ JULIE');return;}
+    }
     askJarvisConversation(text);
   }
 

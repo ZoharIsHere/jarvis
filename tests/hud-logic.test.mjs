@@ -75,7 +75,7 @@ function loadHud() {
     ${src}
     ;globalThis.__t = {
       habitKeywords, computeStreak, jobIsDue, fmtDate, mondayOf, esc, venueFor, hhmm, num, NATIVE,
-      classifyDifficulty
+      classifyDifficulty, navTarget, looksLikeQuestion
     };
   `;
 
@@ -312,4 +312,53 @@ test("long questions escalate past tier 1", () => {
 test("classifier is case-insensitive", () => {
   assert.equal(H.classifyDifficulty("HOW AM I DOING TODAY").tier, 3);
   assert.equal(H.classifyDifficulty("What Is Recursion").tier, 1);
+});
+
+// --- navigation ------------------------------------------------------------
+//
+// Navigation was a raw substring scan, so ordinary words hijacked it:
+// "recommend" contains "comm", "remain" contains "main", "homework" contains
+// "home". The question was dropped and the page silently switched, which is
+// indistinguishable from the app ignoring you. These are the regression tests.
+
+test("ordinary sentences do not trigger navigation", () => {
+  for (const q of [
+    "can you recommend a good study method",
+    "what is the most common sorting algorithm",
+    "how much time does the domain transfer remain",
+    "help me with my homework",
+    "explain what a habitat is",
+    "leave a comment on the pull request",
+  ]) {
+    assert.equal(H.navTarget(q), null, q);
+  }
+});
+
+test("explicit navigation still works", () => {
+  assert.equal(H.navTarget("open habits"), "habits");
+  assert.equal(H.navTarget("go to the planner"), "planner");
+  assert.equal(H.navTarget("show me projects"), "projects");
+  assert.equal(H.navTarget("switch to comms"), "comms");
+  assert.equal(H.navTarget("take me to the dashboard"), "dashboard");
+});
+
+test("bare page names still navigate", () => {
+  assert.equal(H.navTarget("habits"), "habits");
+  assert.equal(H.navTarget("focus"), "focus");
+  assert.equal(H.navTarget("dashboard"), "dashboard");
+});
+
+test("questions are recognized as questions", () => {
+  for (const q of [
+    "what is a stack",
+    "how do I center a div",
+    "can you explain recursion",
+    "is this right?",
+    "tell me about binary trees",
+  ]) {
+    assert.ok(H.looksLikeQuestion(q), q);
+  }
+  for (const s of ["open habits", "mark run done", "I'm fried", "plan my day"]) {
+    assert.ok(!H.looksLikeQuestion(s), s);
+  }
 });
