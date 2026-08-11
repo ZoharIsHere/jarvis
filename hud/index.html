@@ -1133,12 +1133,18 @@
   // models answer general questions well but confidently invent personal
   // details when handed spine data — so anything personal must never be
   // routed local, regardless of how simple it looks.
-  // Bare "i" is deliberately included: "what should I work on next" is about
-  // him even though it names nothing personal, and that's precisely the class
-  // a small model answers by inventing a day he didn't have. When the signal
-  // is ambiguous the safe failure is tier 3 — "I need a key" beats a
-  // confident fabrication.
-  const PERSONAL_RE=/\b(i|i'?m|my|me|mine|today|tonight|tomorrow|yesterday|this week|energy|battery|stress|sleep|habit|streak|deadline|exam|schedule|plan|focus|ceiling|fuel|garmin)\b/;
+  // Two strengths of personal signal, because one wasn't enough.
+  //
+  // STRONG — names his state or his data. Always tier 3.
+  // SELF   — asks about him specifically ("should I", "am I", "did I").
+  //          Also tier 3.
+  //
+  // Bare "i"/"me" on its own is NOT sufficient: "explain how I would
+  // implement a stack" contains "I" but is a general question, and treating
+  // it as personal sent essentially every natural sentence to the cloud.
+  const STRONG_PERSONAL_RE=/\b(my|mine|today|tonight|tomorrow|yesterday|this week|energy|body battery|battery|stress|sleep|slept|habit|streak|deadline|ceiling|fuel|garmin|check ?in|burnout)\b/;
+  const SELF_STATE_RE=/\b(should i|am i|do i|did i|have i|can i|how am i|what should i|how'?s my|how is my|for me to do|my day|my week)\b/;
+  const PERSONAL_RE=new RegExp(`${STRONG_PERSONAL_RE.source}|${SELF_STATE_RE.source}`);
   const ACTION_RE=/\b(add|create|delete|remove|mark|set|start|stop|schedule|remind|send|open|change|update|book|move|snooze)\b/;
   const REASONING_RE=/\b(why|how come|compare|versus|vs\b|trade-?off|explain|analyz|analys|pros and cons|should i|better|best way|strateg|design|plan out|step by step)\b/;
 
@@ -1188,6 +1194,25 @@
     // Fall through to cloud if local is switched off.
     const useTier=(tier<3&&!localEnabled)?3:tier;
 
+    // A cloud-tier question with no key used to fail with a toast and no
+    // speech, so it looked like JARVIS had simply ignored you. Say so out loud
+    // instead, and say what would fix it.
+    if(useTier===3){
+      let ready=false;
+      try{ready=!!(await window.__TAURI__.core.invoke('llm_status')).ready;}catch(e){}
+      if(!ready){
+        const msg=localEnabled
+          ? "That one needs my cloud brain, and there's no API key set. I can still answer general questions, or run any of your commands."
+          : "That needs an API key, which isn't set yet.";
+        showTransmission(msg,'JARVIS','— NO API KEY');
+        speak(msg);
+        toast('✕ NO API KEY · say "save my API key"');
+        micTxt.textContent=listening?'LISTENING':'VOICE OFF';
+        restoreCoreIdle();
+        return;
+      }
+    }
+
     micTxt.textContent='THINKING…';
     setCore(useTier<3?'◦ LOCAL ◦':'◦ THINKING ◦',text.length>34?text.slice(0,34)+'…':text);
     try{
@@ -1206,13 +1231,24 @@
     }catch(e){
       const msg=String(e);
       logLlmCall({tier:useTier,provider:useTier<3?'ollama':'anthropic'},false,false,msg);
-      // A local miss is recoverable and worth explaining; a missing key isn't.
-      if(useTier<3&&/unreachable|ollama/i.test(msg)){
-        toast('✕ LOCAL BRAIN OFFLINE · start Ollama, or set llm_local_enabled=0');
-        speak('My local brain is offline.');
+      // Every failure gets spoken. A silent failure is indistinguishable from
+      // being ignored — which is exactly what made this hard to place.
+      let spoken;
+      if(/unreachable|ollama|unavailable|local model/i.test(msg)){
+        spoken="My local brain isn't running, and I couldn't start it.";
+        toast('✕ LOCAL BRAIN OFFLINE · check Ollama, or set llm_local_enabled=0');
+      }else if(/api key|ANTHROPIC/i.test(msg)){
+        spoken="There's no API key set, so I can't answer that one.";
+        toast('✕ NO API KEY · say "save my API key"');
+      }else if(/rate|429|overload/i.test(msg)){
+        spoken="I'm being rate limited. Give it a moment.";
+        toast('✕ RATE LIMITED');
       }else{
+        spoken="Something went wrong answering that.";
         toast('✕ JARVIS: '+msg);
       }
+      showTransmission(spoken,'JARVIS','— ERROR');
+      speak(spoken);
     }finally{
       micTxt.textContent=listening?'LISTENING':'VOICE OFF';
       restoreCoreIdle();

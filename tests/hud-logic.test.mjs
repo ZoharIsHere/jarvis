@@ -275,6 +275,23 @@ test("simple impersonal questions route to tier 1", () => {
   }
 });
 
+// Regression: bare "I"/"me" used to force tier 3, which sent almost every
+// natural sentence to the cloud. With no API key that failed silently, so
+// JARVIS appeared to transcribe the question and then ignore it.
+test('"I" alone does not make a question personal', () => {
+  for (const q of [
+    "explain how I would implement a stack",
+    "what is the best way for me to learn recursion",
+    "can you tell me what a hash map is",
+    "show me an example of a for loop",
+  ]) {
+    assert.ok(
+      H.classifyDifficulty(q).tier < 3,
+      `${q} → tier ${H.classifyDifficulty(q).tier} (should stay local)`
+    );
+  }
+});
+
 test("reasoning questions route to tier 2", () => {
   for (const q of [
     "why is quicksort faster than bubble sort",
