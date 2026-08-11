@@ -14,6 +14,30 @@ own** and nothing waits on something that hasn't shipped.
 
 ---
 
+## ✅ Shipped so far
+
+| Item | Phase |
+|---|---|
+| Tests — 16, run against the real HUD, CI on push | 0.1 |
+| Secrets in the macOS Keychain (`save my API key`) | 0.3 |
+| Self-diagnostics (`JARVIS, status`) | 0.5 |
+| Job scheduler + `scheduled_jobs` / `job_runs` tables | 1.1 |
+| Garmin on a 4-hour cadence | 1.2 |
+| Weekly review, Sundays 20:00 | 1.3 |
+| Morning briefing, 09:30 | 1.4 |
+| Native macOS notifications (nudges reach you when the HUD is hidden) | — |
+| Spine backup, nightly, 14 retained | — |
+| Continuous conversation (follow-up without pressing again) | 8.3 |
+| Learning-loop sampling into `energy_log` + curve-error reporting | 6.2 (partial) |
+| Context handoff (`what was I doing yesterday`) | — |
+
+**Still unblocked and not yet built:** HUD file split (0.4), migration
+auto-run (0.2), wake-up sequence (1.5 — needs the song file), spine server
+(Phase 4), OCR via Apple Vision (7.2), Piper TTS (8.1), media panels (8.5),
+multi-day planning, "explain yourself", dry-run mode.
+
+---
+
 ## Phase 0 — Foundations (🟢)
 
 Boring, and everything later is safer for it. No new capability.

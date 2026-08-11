@@ -68,6 +68,14 @@ an env var and tell me the name. I'll wire it to Keychain like the API key.
 ### 6. *Highway to Hell* — a local copy
 For the wake-up sequence. A file you own, kept local — don't stream it. Drop it
 at `~/Projects/jarvis/assets/wake.mp3` (gitignored) and tell me.
+**Blocks:** the clap-to-wake sequence (§3.5). Everything else in scheduled mode
+already works without it.
+
+### 6b. Decide: Piper voice (free, ~60MB download)
+`say -v Daniel` is audibly synthetic. [Piper](https://github.com/rhasspy/piper)
+is a free local neural voice — prebuilt macOS binaries, so unlike whisper.cpp
+it isn't blocked by your toolchain. I just need a yes to download it and a
+voice preference (there are several British male models).
 
 ### 7. Picovoice key — proper wake word
 Free tier at [console.picovoice.ai](https://console.picovoice.ai). Fixes
