@@ -74,7 +74,8 @@ function loadHud() {
   const harness = `
     ${src}
     ;globalThis.__t = {
-      habitKeywords, computeStreak, jobIsDue, fmtDate, mondayOf, esc, venueFor, hhmm, num, NATIVE
+      habitKeywords, computeStreak, jobIsDue, fmtDate, mondayOf, esc, venueFor, hhmm, num, NATIVE,
+      classifyDifficulty
     };
   `;
 
@@ -226,4 +227,72 @@ test("num falls back when a setting is missing or unparseable", () => {
   assert.equal(H.num({ a: "75" }, "a", 1), 75);
   assert.equal(H.num({}, "missing", 42), 42);
   assert.equal(H.num({ b: "abc" }, "b", 7), 7);
+});
+
+// --- difficulty router ------------------------------------------------------
+//
+// Tier 3 is the safety property: benchmarking showed sub-2B models answer
+// general questions well but fabricate personal details when handed spine
+// data. Anything about his life must never route local, so these are the
+// tests that actually matter — a false negative here means JARVIS confidently
+// inventing a study session that never happened.
+
+test("anything personal routes to tier 3", () => {
+  for (const q of [
+    "how am I doing today",
+    "what should I work on next",
+    "how did I sleep",
+    "is my energy good right now",
+    "what's my deadline for the exam",
+    "am I on track with my habits",
+    "how's my streak looking",
+    "what's on my schedule tonight",
+  ]) {
+    assert.equal(H.classifyDifficulty(q).tier, 3, q);
+  }
+});
+
+test("action requests route to tier 3", () => {
+  for (const q of [
+    "add a task to review linked lists",
+    "remind me to call the office",
+    "snooze that deadline",
+    "start a focus block",
+    "delete the run habit",
+  ]) {
+    assert.equal(H.classifyDifficulty(q).tier, 3, q);
+  }
+});
+
+test("simple impersonal questions route to tier 1", () => {
+  for (const q of [
+    "what is a binary search tree",
+    "who wrote the Iliad",
+    "what does recursion mean",
+    "capital of France",
+  ]) {
+    assert.equal(H.classifyDifficulty(q).tier, 1, q);
+  }
+});
+
+test("reasoning questions route to tier 2", () => {
+  for (const q of [
+    "why is quicksort faster than bubble sort",
+    "compare arrays and linked lists",
+    "explain the tradeoff between recursion and iteration",
+  ]) {
+    assert.equal(H.classifyDifficulty(q).tier, 2, q);
+  }
+});
+
+test("long questions escalate past tier 1", () => {
+  const long =
+    "what is the difference between a stack and a queue and when would " +
+    "you reach for one over the other in a typical program you might write";
+  assert.ok(H.classifyDifficulty(long).tier >= 2);
+});
+
+test("classifier is case-insensitive", () => {
+  assert.equal(H.classifyDifficulty("HOW AM I DOING TODAY").tier, 3);
+  assert.equal(H.classifyDifficulty("What Is Recursion").tier, 1);
 });

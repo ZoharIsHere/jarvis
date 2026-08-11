@@ -174,24 +174,63 @@ fn reset_conversation() {
 //
 // `context` is a live snapshot of the spine (energy, habits, deadlines) built by
 // the frontend, which already holds the DB connection.
+/// `tier` comes from the frontend's cheap classifier:
+///   1 — simple general question  → small local model, minimal prompt
+///   2 — needs some reasoning     → mid local model, minimal prompt
+///   3 — needs his actual data, or wants something done → cloud
+///
+/// Tiers 1-2 deliberately get **no memory and no spine context**. That isn't a
+/// shortcut: feeding a sub-2B model his energy readings is precisely what made
+/// it invent a study session in benchmarking, and the smaller prompt is also
+/// what takes these from ~12s to ~3.5s.
 #[tauri::command]
-async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, String> {
-    let mut system = PERSONA.to_string();
-    let memories = read_memory_files();
-    if !memories.is_empty() {
-        system.push_str("\n\nWhat you know about Zohar (from your saved notes):");
-        system.push_str(&memories);
-    }
-    if let Some(ctx) = context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        system.push_str(&format!(
-            "\n\nLive readings from the spine (his local database) right now:\n{ctx}\n\
-             Use these when he asks how he's doing or what to work on. Don't recite \
-             them unless asked."
-        ));
+async fn ask_jarvis(
+    prompt: String,
+    context: Option<String>,
+    tier: Option<u8>,
+    models: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    let tier = tier.unwrap_or(3).clamp(1, 3);
+    let local = tier < 3;
+
+    // Prompt length dominates latency on local models — measured at ~2s of the
+    // ~5.7s round trip for the full persona. Tier 1 therefore gets a compact
+    // brief instead: it keeps the voice and the do-not-fabricate rule, which
+    // are the only parts that change the answer, and drops the rest.
+    let mut system = if local {
+        "You are JARVIS, a calm, precise British butler. Answer in 1-2 short spoken \
+         sentences, no markdown or lists. You cannot see his personal data here — never \
+         invent details about his day, sleep, habits or schedule; say you need to check."
+            .to_string()
+    } else {
+        PERSONA.to_string()
+    };
+    if local {
+        // Tier 2 can afford a little more character without hurting latency much.
+        if tier == 2 {
+            system.push_str(" Take a moment to reason before answering.");
+        }
+    } else {
+        let memories = read_memory_files();
+        if !memories.is_empty() {
+            system.push_str("\n\nWhat you know about Zohar (from your saved notes):");
+            system.push_str(&memories);
+        }
+        if let Some(ctx) = context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            system.push_str(&format!(
+                "\n\nLive readings from the spine (his local database) right now:\n{ctx}\n\
+                 Use these when he asks how he's doing or what to work on. Don't recite \
+                 them unless asked."
+            ));
+        }
     }
 
-    // History + this turn. Lock is released before the await.
-    let messages = {
+    // Only the cloud tier carries conversation history — resending it to a
+    // local model is most of its latency, and history is where the personal
+    // details a small model would garble live.
+    let messages = if local {
+        vec![serde_json::json!({"role": "user", "content": prompt})]
+    } else {
         let mut hist = HISTORY.lock().map_err(|_| "history lock poisoned".to_string())?;
         hist.push(serde_json::json!({"role": "user", "content": prompt}));
         if hist.len() > MAX_TURNS {
@@ -209,27 +248,54 @@ async fn ask_jarvis(prompt: String, context: Option<String>) -> Result<String, S
         }
     }
 
-    let result = match provider() {
-        Provider::Ollama => ask_ollama(&system, &messages).await,
-        Provider::Anthropic => ask_anthropic(&system, &messages).await,
+    let started = std::time::Instant::now();
+    let models = models.unwrap_or_default();
+    let chosen_model = if local {
+        models
+            .get((tier as usize) - 1)
+            .cloned()
+            .unwrap_or_else(|| "qwen2.5:0.5b".to_string())
+    } else {
+        "claude-sonnet-5".to_string()
+    };
+
+    let result = if local {
+        ask_ollama_model(&chosen_model, &system, &messages).await
+    } else {
+        ask_anthropic(&system, &messages).await
     };
 
     let text = match result {
         Ok(t) if !t.trim().is_empty() => t,
         Ok(_) => {
-            rollback();
+            if !local {
+                rollback();
+            }
             return Err("empty response".to_string());
         }
         Err(e) => {
-            rollback();
+            if !local {
+                rollback();
+            }
             return Err(e);
         }
     };
 
-    if let Ok(mut hist) = HISTORY.lock() {
-        hist.push(serde_json::json!({"role": "assistant", "content": text}));
+    if !local {
+        if let Ok(mut hist) = HISTORY.lock() {
+            hist.push(serde_json::json!({"role": "assistant", "content": text}));
+        }
     }
-    Ok(text)
+
+    // Return the routing outcome alongside the answer so the frontend can log
+    // what actually happened rather than what it intended.
+    Ok(serde_json::json!({
+        "text": text,
+        "tier": tier,
+        "provider": if local { "ollama" } else { "anthropic" },
+        "model": chosen_model,
+        "latency_ms": started.elapsed().as_millis() as u64,
+    }))
 }
 
 /// Which brain answers. Defaults to Anthropic; `JARVIS_LLM=ollama` switches to a
@@ -322,12 +388,79 @@ async fn ask_anthropic(system: &str, messages: &[serde_json::Value]) -> Result<S
 
 /// Local model via Ollama's chat API. Ollama takes the system prompt as a
 /// message rather than a separate field.
-async fn ask_ollama(system: &str, messages: &[serde_json::Value]) -> Result<String, String> {
+/// Start the local model server if it isn't already up.
+///
+/// Deliberately started on demand rather than via a LaunchAgent: the app
+/// already owns its own scheduling, and a second scheduler is how you end up
+/// with two things racing to do the same job.
+fn ensure_ollama() -> bool {
+    // Cheap liveness check first — nothing to do if it's already serving.
+    let up = |()| {
+        std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:11434".parse().unwrap(),
+            std::time::Duration::from_millis(300),
+        )
+        .is_ok()
+    };
+    if up(()) {
+        return true;
+    }
+
+    let candidates = [
+        dirs_home().join("Applications/Ollama.app/Contents/Resources/ollama"),
+        PathBuf::from("/Applications/Ollama.app/Contents/Resources/ollama"),
+        PathBuf::from("/usr/local/bin/ollama"),
+        PathBuf::from("/opt/homebrew/bin/ollama"),
+    ];
+    let Some(bin) = candidates.into_iter().find(|p| p.exists()) else {
+        return false;
+    };
+
+    if Command::new(bin)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_err()
+    {
+        return false;
+    }
+
+    // Model load is lazy, so we only wait for the socket, not for readiness.
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if up(()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn dirs_home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+}
+
+async fn ask_ollama_model(
+    model: &str,
+    system: &str,
+    messages: &[serde_json::Value],
+) -> Result<String, String> {
+    // Starting the server is blocking, so keep it off the async runtime.
+    let started = tauri::async_runtime::spawn_blocking(ensure_ollama)
+        .await
+        .unwrap_or(false);
+    if !started {
+        return Err(
+            "local model server unavailable — install Ollama or set llm_local_enabled=0".into(),
+        );
+    }
+
     let mut msgs = vec![serde_json::json!({"role": "system", "content": system})];
     msgs.extend_from_slice(messages);
 
     let body = serde_json::json!({
-        "model": ollama_model(),
+        "model": model,
         "messages": msgs,
         "stream": false,
         "options": { "num_predict": 200 },
@@ -930,6 +1063,12 @@ pub fn run() {
                             version: 3,
                             description: "scheduler_003",
                             sql: include_str!("../migrations/003_scheduler.sql"),
+                            kind: MigrationKind::Up,
+                        },
+                        Migration {
+                            version: 4,
+                            description: "llm_calls_004",
+                            sql: include_str!("../migrations/004_llm_calls.sql"),
                             kind: MigrationKind::Up,
                         },
                     ],

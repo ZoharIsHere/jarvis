@@ -1,5 +1,9 @@
 # Things only you can do
 
+> **Want the version with exact commands?** → [`SETUP.md`](SETUP.md) walks
+> through each of these step by step. This file is the checklist; that one is
+> the guide.
+
 Everything in [`ROADMAP.md`](ROADMAP.md) that I can't do myself. Kept current —
 items move to **Done** rather than disappearing, so nothing gets silently
 dropped.
@@ -108,12 +112,28 @@ Gatekeeper. Not needed for your own machine.
 
 ---
 
+## 🔵 New — resolve the duplicate Garmin scheduler
+
+You have a `launchd` job running the collector at login, and JARVIS now runs it
+every 4 hours. Both firing doubles your request rate against the API that's
+currently rate-limiting you. Do this **before** retrying Garmin:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.hila.jarvis.garmin.plist
+```
+
+---
+
 ## ✅ Done
 
 - ✅ Install `gh` and authenticate
 - ✅ Grant microphone + speech-recognition permission
 - ✅ Confirm the Tauri window renders the HUD
 - ✅ Approve the public repo + first push
+- ✅ Autostart at login — enabled
+- ✅ Piper neural voice — installed (en_GB-alan-medium)
+- ✅ Native look — reworked
+- ✅ Local brain — Ollama + models installed to `~/Applications` / `~/.ollama`
 
 ---
 

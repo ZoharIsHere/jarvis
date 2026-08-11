@@ -149,6 +149,31 @@ both**, so caching does nothing yet. Revisit once memory files get bigger.
 
 ---
 
+## Update: prompt size was the bottleneck, not the model
+
+The benchmark above used the **full** JARVIS prompt (persona + `MEMORY.md` +
+spine snapshot, ~375 tokens). Re-measured with a compact prompt and no personal
+context:
+
+| Prompt | Model | Time | Quality |
+|---|---|---:|---|
+| Full (375 tok) | qwen2.5:0.5b | 12.5s | Fabricated; misread the clock |
+| Persona + guard (~180 tok) | qwen2.5:0.5b | 5.7s | Correct |
+| **Compact (76 tok)** | **qwen2.5:0.5b** | **2.0s** | **Correct** |
+| Compact | qwen2.5:1.5b | 8.8s | Correct, better phrased |
+
+**Two conclusions.** Latency scales with prompt size far more than with model
+size — trimming the prompt bought 6x while *keeping* the same model. And the
+hallucinations in the original benchmark came from feeding a sub-2B model spine
+data it couldn't parse, not from the questions themselves: asked general
+questions with no personal context, all of these answer correctly.
+
+Hence the tiered router (`classifyDifficulty` in the HUD, `ask_jarvis` in
+Rust): simple impersonal questions go local and free, anything touching his
+actual data goes to the cloud. Verified the guard holds — asked *"how did I
+sleep last night?"*, the local model says it can't see that rather than
+inventing a number.
+
 ## Verdict
 
 **Use the cloud brain on this machine.** Local inference is not viable here —

@@ -1119,6 +1119,53 @@
     return parts.join('\n');
   }
 
+  // ==========================================================
+  // DIFFICULTY ROUTER
+  //
+  // Picks which brain answers, using string signals only — calling a model to
+  // decide which model to call would defeat the point.
+  //
+  //   1 — simple general question   → small local model  (~3.5s, free)
+  //   2 — needs some reasoning      → mid local model    (~8s, free)
+  //   3 — needs HIS data, or wants something done → cloud (needs a key)
+  //
+  // Tier 3 detection is the one that matters. Benchmarking showed sub-2B
+  // models answer general questions well but confidently invent personal
+  // details when handed spine data — so anything personal must never be
+  // routed local, regardless of how simple it looks.
+  // Bare "i" is deliberately included: "what should I work on next" is about
+  // him even though it names nothing personal, and that's precisely the class
+  // a small model answers by inventing a day he didn't have. When the signal
+  // is ambiguous the safe failure is tier 3 — "I need a key" beats a
+  // confident fabrication.
+  const PERSONAL_RE=/\b(i|i'?m|my|me|mine|today|tonight|tomorrow|yesterday|this week|energy|battery|stress|sleep|habit|streak|deadline|exam|schedule|plan|focus|ceiling|fuel|garmin)\b/;
+  const ACTION_RE=/\b(add|create|delete|remove|mark|set|start|stop|schedule|remind|send|open|change|update|book|move|snooze)\b/;
+  const REASONING_RE=/\b(why|how come|compare|versus|vs\b|trade-?off|explain|analyz|analys|pros and cons|should i|better|best way|strateg|design|plan out|step by step)\b/;
+
+  function classifyDifficulty(text){
+    const t=text.toLowerCase().trim();
+    // Anything touching his life or asking for an action needs the good model.
+    if(PERSONAL_RE.test(t)||ACTION_RE.test(t))return {tier:3,why:'personal or actionable'};
+    // Long or multi-clause questions outgrow the smallest model.
+    const words=t.split(/\s+/).length;
+    if(REASONING_RE.test(t)||words>25||(t.match(/[?.]/g)||[]).length>1)
+      return {tier:2,why:'reasoning or multi-part'};
+    return {tier:1,why:'simple factual'};
+  }
+
+  async function logLlmCall(r,escalated,ok,note){
+    try{
+      await dbExecute(
+        'INSERT INTO llm_calls (tier,provider,model,latency_ms,escalated,ok,note) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [r.tier??0,r.provider||'?',r.model||null,r.latency_ms||null,escalated?1:0,ok?1:0,(note||'').slice(0,200)]);
+    }catch(e){console.error('llm log failed',e);}
+  }
+
+  async function tierModels(){
+    const s=await loadSettings();
+    return [s['llm_tier1_model']||'qwen2.5:0.5b', s['llm_tier2_model']||'qwen2.5:1.5b'];
+  }
+
   async function askJarvisConversation(text){
     if(!NATIVE){
       toast('✕ NOT RECOGNIZED: "'+text+'" · (live conversation needs the desktop app)');
@@ -1135,18 +1182,37 @@
       }catch(e){toast('✕ MEMORY: '+e);}
       return;
     }
+    const {tier,why}=classifyDifficulty(text);
+    const s=await loadSettings();
+    const localEnabled=(s['llm_local_enabled']||'1')!=='0';
+    // Fall through to cloud if local is switched off.
+    const useTier=(tier<3&&!localEnabled)?3:tier;
+
     micTxt.textContent='THINKING…';
-    setCore('◦ THINKING ◦',text.length>34?text.slice(0,34)+'…':text);
+    setCore(useTier<3?'◦ LOCAL ◦':'◦ THINKING ◦',text.length>34?text.slice(0,34)+'…':text);
     try{
-      const context=await buildSpineContext();
-      const reply=await window.__TAURI__.core.invoke('ask_jarvis',{prompt:text,context});
+      // Only the cloud tier gets spine context — see ask_jarvis for why.
+      const context=useTier===3?await buildSpineContext():null;
+      const r=await window.__TAURI__.core.invoke('ask_jarvis',
+        {prompt:text,context,tier:useTier,models:await tierModels()});
       const short=text.length>40?text.slice(0,40)+'…':text;
-      showTransmission(reply,'JARVIS','— IN REPLY TO "'+short.toUpperCase()+'"');
+      const tag=r.provider==='ollama'?`— LOCAL · ${r.model} · ${Math.round((r.latency_ms||0)/100)/10}s`
+                                     :`— IN REPLY TO "${short.toUpperCase()}"`;
+      showTransmission(r.text,'JARVIS',tag);
+      logLlmCall(r,false,true,why);
       // Reopen the mic once he's finished speaking, so a follow-up is just
       // talking rather than pressing again.
-      speak(reply,{onend:maybeContinue});
+      speak(r.text,{onend:maybeContinue});
     }catch(e){
-      toast('✕ JARVIS: '+e);
+      const msg=String(e);
+      logLlmCall({tier:useTier,provider:useTier<3?'ollama':'anthropic'},false,false,msg);
+      // A local miss is recoverable and worth explaining; a missing key isn't.
+      if(useTier<3&&/unreachable|ollama/i.test(msg)){
+        toast('✕ LOCAL BRAIN OFFLINE · start Ollama, or set llm_local_enabled=0');
+        speak('My local brain is offline.');
+      }else{
+        toast('✕ JARVIS: '+msg);
+      }
     }finally{
       micTxt.textContent=listening?'LISTENING':'VOICE OFF';
       restoreCoreIdle();
