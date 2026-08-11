@@ -34,6 +34,91 @@ aloud, so keep them short and conversational: 1-3 sentences, no markdown, no lis
 no emoji. Never read out raw numbers robotically; speak naturally. If you genuinely \
 don't know something, say so plainly.";
 
+// ---- secrets ---------------------------------------------------------------
+// Env vars die with the shell, which meant re-exporting the key on every
+// launch. These read the login Keychain instead, so a secret is stored once.
+// Env still wins when set, so a one-off override is still possible.
+
+const KEYCHAIN_ACCOUNT: &str = "jarvis";
+
+/// Read a secret: environment first, then the login Keychain.
+fn secret(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    let out = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-s",
+            name,
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Store a secret in the login Keychain. `-U` updates an existing entry.
+///
+/// The value is passed as a separate argument, never interpolated into a
+/// shell string, so it can't be re-interpreted. It will briefly be visible
+/// in this process's argv — acceptable for a single-user desktop app, and
+/// noted here so it isn't mistaken for a stronger guarantee than it is.
+#[tauri::command]
+fn set_secret(name: String, value: String) -> Result<(), String> {
+    if name.trim().is_empty() || value.trim().is_empty() {
+        return Err("name and value are required".into());
+    }
+    let status = Command::new("security")
+        .args([
+            "add-generic-password",
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-s",
+            &name,
+            "-w",
+            &value,
+            "-U",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("keychain write failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("keychain rejected the write".into())
+    }
+}
+
+/// Which secrets exist, without ever returning their values.
+#[tauri::command]
+fn secret_status() -> serde_json::Value {
+    let names = ["ANTHROPIC_API_KEY", "TUYA_ACCESS_ID", "TUYA_ACCESS_SECRET"];
+    let mut out = serde_json::Map::new();
+    for n in names {
+        let from_env = std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false);
+        let present = from_env || secret(n).is_some();
+        out.insert(
+            n.to_string(),
+            serde_json::json!({ "present": present, "source": if from_env { "env" } else if present { "keychain" } else { "none" } }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
 /// Where JARVIS keeps durable notes. Deliberately the OpenClaw-compatible layout
 /// from the project's PRD (USER.md / MEMORY.md / memory/YYYY-MM-DD.md) so that
 /// migrating the brain later doesn't mean rewriting memory.
@@ -174,7 +259,7 @@ fn llm_status() -> serde_json::Value {
         Provider::Anthropic => serde_json::json!({
             "provider": "anthropic",
             "model": "claude-sonnet-5",
-            "ready": std::env::var("ANTHROPIC_API_KEY").is_ok(),
+            "ready": secret("ANTHROPIC_API_KEY").is_some(),
         }),
     }
 }
@@ -188,8 +273,11 @@ fn ollama_url() -> String {
 }
 
 async fn ask_anthropic(system: &str, messages: &[serde_json::Value]) -> Result<String, String> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY not set — export it before launching the app".to_string())?;
+    let key = secret("ANTHROPIC_API_KEY").ok_or_else(|| {
+        "No Anthropic API key. Say \"save my API key\" to store it in the Keychain, \
+         or export ANTHROPIC_API_KEY before launching."
+            .to_string()
+    })?;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-5",
@@ -805,7 +893,9 @@ pub fn run() {
             notify,
             backup_spine,
             run_garmin_collector,
-            diagnostics
+            diagnostics,
+            set_secret,
+            secret_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

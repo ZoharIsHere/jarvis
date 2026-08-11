@@ -31,6 +31,10 @@ Same story — an `ntn_...` token was exposed outside the repo.
 Key. Needs a payment method; it's pay-as-you-go and billed **separately** from
 any Claude.ai subscription — there is no way to route one through the other.
 
+**When you have it**, just say *"save my API key"* to JARVIS and paste it into
+the prompt. It goes into the macOS Keychain — no exporting on every launch, and
+it never touches the repo. (Don't paste it into chat here.)
+
 **Cost, measured on your actual usage shape** (~400 tokens in, ~85 out per
 exchange): roughly **$0.50–1.00/month** at 20 exchanges/day on Haiku or Sonnet.
 See [`BRAINS.md`](BRAINS.md) for the full table.

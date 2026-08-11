@@ -1107,7 +1107,9 @@
       const reply=await window.__TAURI__.core.invoke('ask_jarvis',{prompt:text,context});
       const short=text.length>40?text.slice(0,40)+'…':text;
       showTransmission(reply,'JARVIS','— IN REPLY TO "'+short.toUpperCase()+'"');
-      speak(reply);
+      // Reopen the mic once he's finished speaking, so a follow-up is just
+      // talking rather than pressing again.
+      speak(reply,{onend:maybeContinue});
     }catch(e){
       toast('✕ JARVIS: '+e);
     }finally{
@@ -1173,6 +1175,7 @@
     if(fuel!==null&&/\b(i'?m|i am|feeling|check ?in|fuel)\b/.test(t)){
       try{
         await dbExecute('INSERT INTO checkins (fuel) VALUES ($1)',[fuel]);
+        await logEnergySample(fuel);   // labelled sample for the learning loop
         const reply=fuel<=1?"Noted. I'll keep the load light."
                    :fuel<=2?"Noted. Let's not push it today."
                    :fuel<=3?"Noted."
@@ -1239,6 +1242,23 @@
       return true;
     }
 
+    // Storing a secret by voice would mean speaking it aloud and putting it in
+    // the transcript — so this only opens a prompt and never handles the value
+    // through speech.
+    if(/\b(save|store|set)\b.*\b(api ?key|anthropic key|my key)\b/.test(t)){
+      const v=window.prompt('Paste your Anthropic API key (stored in the macOS Keychain, never in the repo):');
+      if(v&&v.trim()){
+        try{
+          await window.__TAURI__.core.invoke('set_secret',{name:'ANTHROPIC_API_KEY',value:v.trim()});
+          toast('✓ KEY SAVED TO KEYCHAIN');
+          speak('Key saved. Conversation is online.');
+        }catch(e){toast('✕ KEYCHAIN: '+e);}
+      }else{
+        speak('Cancelled.');
+      }
+      return true;
+    }
+
     // "back up" — the one file holding everything.
     if(/\b(back ?up|backup)\b.*\b(spine|database|db|everything)\b|\bback ?up now\b/.test(t)){
       try{
@@ -1302,8 +1322,20 @@
   // permission on macOS — see src-tauri/speech/JarvisListen.swift — so the app
   // shells out to a native AVFoundation helper instead. Browser keeps using
   // webkitSpeechRecognition, which works fine there.
-  async function listenNative(){
+  // After JARVIS answers, reopen the mic once so a follow-up doesn't need
+  // another press. The native helper exits on silence, so saying nothing
+  // simply ends the exchange — no timer to get wrong, no runaway loop.
+  let continueChain=0;
+  const MAX_CHAIN=6;
+  function maybeContinue(){
+    if(!NATIVE||continueChain>=MAX_CHAIN)  {continueChain=0;return;}
+    continueChain++;
+    setTimeout(()=>{ if(!listening&&!busy)listenNative(true); },600);
+  }
+
+  async function listenNative(isFollowUp){
     if(listening)return;
+    if(!isFollowUp)continueChain=0;   // a deliberate press starts a fresh chain
     // Barge-in: talking over JARVIS cuts him off instead of queueing behind him.
     window.__TAURI__.core.invoke('stop_speaking').catch(()=>{});
     if(busy){clearTimeout(hideTimer);hideLine();}
@@ -1343,7 +1375,7 @@
     };
     rec.start();
   }
-  function toggleListening(){NATIVE?listenNative():listenBrowser();}
+  function toggleListening(){NATIVE?listenNative(false):listenBrowser();}
   micBtn.addEventListener('click',toggleListening);
 
   // ---- hands-free wake word ("Jarvis, ...") ----
@@ -1654,6 +1686,42 @@
   }
 
   // ==========================================================
+  // LEARNING LOOP (JARVIS_MASTER.md §3.1) — log predicted vs actual so the
+  // energy curve can stop being a fixed night-owl shape and become his.
+  //
+  // `energy_log` was created in migration 001 and has been empty since. Each
+  // check-in is a labelled sample: the model predicted N for this hour, the
+  // human reported M. Enough samples and the shape can be corrected.
+  // ==========================================================
+  const FUEL_TO_ENERGY={1:15,2:35,3:60,4:85};   // 1-4 self-report → 0-100 scale
+
+  async function logEnergySample(fuel){
+    try{
+      const hour=new Date().getHours();
+      const date=fmtDate(new Date());
+      const fc=await dbSelect(
+        'SELECT energy FROM energy_forecast WHERE date=(SELECT MAX(date) FROM energy_forecast) AND hour=$1',[hour]);
+      const predicted=fc&&fc[0]?fc[0].energy:null;
+      const actual=FUEL_TO_ENERGY[fuel]??null;
+      await dbExecute(
+        'INSERT INTO energy_log (date,hour,predicted_energy,actual_energy,note) VALUES ($1,$2,$3,$4,$5)',
+        [date,hour,predicted,actual,'self-report fuel '+fuel+'/4']);
+    }catch(e){console.error('energy sample failed',e);}
+  }
+
+  // How wrong the curve has been, per hour. This is the input a future
+  // adjustment step would use; surfacing it first so the error is visible
+  // before anything starts acting on it.
+  async function curveAccuracy(){
+    const rows=await dbSelect(
+      'SELECT hour, AVG(actual_energy - predicted_energy) AS bias, COUNT(*) AS n '+
+      'FROM energy_log WHERE predicted_energy IS NOT NULL AND actual_energy IS NOT NULL '+
+      'GROUP BY hour HAVING n >= 3 ORDER BY ABS(bias) DESC');
+    if(!rows||!rows.length)return null;
+    return rows.map(r=>({hour:r.hour,bias:Math.round(r.bias),n:r.n}));
+  }
+
+  // ==========================================================
   // SCHEDULED MODE — the third agent mode (on-demand / scheduled / continuous)
   //
   // Jobs live in `scheduled_jobs` so they survive restarts and are tunable
@@ -1915,6 +1983,13 @@
     if(blocks&&blocks[0])lines.push(`Focus blocks completed: ${blocks[0].n}`);
     if(usage.length)lines.push('Most-used: '+usage.map(u=>`${u.app} ${Math.round(u.m/60*10)/10}h`).join(' · '));
     if(checks&&checks[0]&&checks[0].n)lines.push(`Avg self-reported fuel: ${(checks[0].f||0).toFixed(1)}/4 over ${checks[0].n} check-ins`);
+    // Honesty about the model: report where the fixed curve is wrong rather
+    // than implying it's already personalized.
+    const bias=await curveAccuracy();
+    if(bias&&bias.length){
+      const worst=bias[0];
+      lines.push(`Energy curve is off by ${worst.bias>0?'+':''}${worst.bias} around ${String(worst.hour).padStart(2,'0')}:00 (${worst.n} samples)`);
+    }
     if(lines.length===1)lines.push('Not enough logged yet for a useful review.');
     return lines.join('\n');
   }
