@@ -28,3 +28,7 @@ src-tauri/bin/
 *.njsproj
 *.sln
 *.sw?
+
+# Piper TTS binary + voice model (large, downloaded not authored)
+vendor/
+assets/

@@ -528,6 +528,116 @@ fn stop_speaking() {
     }
 }
 
+// ---- Piper: local neural TTS ----------------------------------------------
+// `say -v Daniel` is instant but audibly synthetic. Piper sounds far better,
+// but a cold process costs ~2.8s (model load) against ~0.3s per sentence once
+// warm — so it's kept alive between utterances rather than spawned per reply.
+//
+// Falls back to `say` whenever Piper isn't installed or misbehaves; the voice
+// should degrade, never break.
+
+struct Piper {
+    child: std::process::Child,
+    out_dir: PathBuf,
+}
+static PIPER: std::sync::Mutex<Option<Piper>> = std::sync::Mutex::new(None);
+
+fn piper_model() -> Option<PathBuf> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()?
+        .join("vendor/en_GB-alan-medium.onnx");
+    p.exists().then_some(p)
+}
+
+/// Start (or reuse) the warm Piper process. Returns the directory it writes into.
+fn piper_ensure() -> Option<PathBuf> {
+    let mut guard = PIPER.lock().ok()?;
+
+    // Reap a process that died since last time.
+    if let Some(p) = guard.as_mut() {
+        match p.child.try_wait() {
+            Ok(None) => return Some(p.out_dir.clone()),
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    let model = piper_model()?;
+    let out_dir = std::env::temp_dir().join("jarvis-piper");
+    std::fs::create_dir_all(&out_dir).ok()?;
+
+    let child = Command::new("python3")
+        .arg("-m")
+        .arg("piper")
+        .arg("--model")
+        .arg(&model)
+        .arg("--output-dir")
+        .arg(&out_dir)
+        .arg("--output-dir-naming")
+        .arg("timestamp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    *guard = Some(Piper {
+        child,
+        out_dir: out_dir.clone(),
+    });
+    Some(out_dir)
+}
+
+fn wav_files(dir: &PathBuf) -> std::collections::HashSet<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Synthesize one line with Piper and return the WAV it produced.
+fn piper_say(text: &str) -> Option<PathBuf> {
+    use std::io::Write;
+    let out_dir = piper_ensure()?;
+    let before = wav_files(&out_dir);
+
+    {
+        let mut guard = PIPER.lock().ok()?;
+        let p = guard.as_mut()?;
+        let stdin = p.child.stdin.as_mut()?;
+        // One utterance per line; newlines inside would split it into several.
+        let line = text.replace('\n', " ");
+        writeln!(stdin, "{line}").ok()?;
+        stdin.flush().ok()?;
+    }
+
+    // Wait for the new file. Generous ceiling: a long reply on a slow CPU.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let after = wav_files(&out_dir);
+        if let Some(new) = after.difference(&before).next() {
+            // Let the file finish being written before playing it.
+            let mut last = 0u64;
+            for _ in 0..50 {
+                let size = std::fs::metadata(new).map(|m| m.len()).unwrap_or(0);
+                if size > 0 && size == last {
+                    break;
+                }
+                last = size;
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            return Some(new.clone());
+        }
+    }
+    None
+}
+
 /// Speak text using the system voice. WKWebView's speechSynthesis is
 /// unreliable in a packaged app, and macOS ships better voices anyway.
 #[tauri::command]
@@ -540,14 +650,31 @@ async fn speak_native(text: String, voice: Option<String>) -> Result<(), String>
 
     let voice = voice.unwrap_or_else(|| "Daniel".to_string());
     tauri::async_runtime::spawn_blocking(move || {
-        // Passed as separate args (never through a shell), so text is not interpreted.
-        let child = Command::new("say")
-            .args(["-v", &voice, "-r", "185", "--", &text])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("say failed: {e}"))?;
+        // Prefer Piper; fall back to `say` if it isn't installed or stalls, so
+        // a TTS problem degrades the voice rather than silencing him.
+        let piper_wav = if std::env::var("JARVIS_TTS").as_deref() == Ok("say") {
+            None
+        } else {
+            piper_say(&text)
+        };
+
+        let child = match &piper_wav {
+            Some(wav) => Command::new("afplay")
+                .arg(wav)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("afplay failed: {e}"))?,
+            None => Command::new("say")
+                // Separate args, never through a shell, so text isn't interpreted.
+                .args(["-v", &voice, "-r", "185", "--", &text])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("say failed: {e}"))?,
+        };
 
         if let Ok(mut guard) = SPEAKING.lock() {
             *guard = Some(child);
@@ -573,6 +700,10 @@ async fn speak_native(text: String, voice: Option<String>) -> Result<(), String>
                 },
                 None => break, // interrupted by stop_speaking()
             }
+        }
+        // Don't let synthesized audio pile up in temp.
+        if let Some(wav) = piper_wav {
+            let _ = std::fs::remove_file(wav);
         }
         Ok(())
     })
@@ -822,6 +953,19 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Launch at login. Scheduled jobs (morning briefing, Garmin sync)
+            // only fire while the app is running, so autostart is what makes
+            // "scheduled mode" actually scheduled.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let mgr = app.autolaunch();
+                if !mgr.is_enabled().unwrap_or(false) {
+                    if let Err(e) = mgr.enable() {
+                        eprintln!("could not enable autostart: {e}");
+                    }
+                }
+            }
 
             let show = MenuItem::with_id(app, "show", "Show JARVIS", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;

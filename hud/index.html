@@ -407,24 +407,59 @@
      GitHub Pages / plain-browser demo is untouched — browsers render the
      full clip-path/glow version fine; this WKWebView-on-this-Mac combo
      doesn't, so the native app gets a softer, cheaper equivalent look. */
-  body.native *{box-shadow:none!important;backdrop-filter:none!important}
-  body.native *{transition-timing-function:cubic-bezier(.22,1,.36,1)!important}
-  body.native .mic,body.native .back{clip-path:none!important;border-radius:20px}
-  body.native .tile,body.native .clustertile{clip-path:none!important;border-radius:12px}
-  body.native .proj{clip-path:none!important;border-radius:16px}
-  body.native .sbtn{clip-path:none!important;border-radius:14px}
-  body.native .bootbtn{clip-path:none!important;border-radius:14px}
-  body.native .dl-row,body.native .habit{clip-path:none!important;border-radius:14px}
-  body.native .day{clip-path:none!important;border-radius:8px}
-  body.native .navbtn{clip-path:none!important;border-radius:10px}
-  body.native .tx-frame{clip-path:none!important;border-radius:24px}
-  body.native .vtoast,body.native .demobar,body.native .sb{clip-path:none!important;border-radius:12px}
-  body.native .alertbar{clip-path:none!important;border-radius:16px}
-  /* keep a whisper of glow on key live/active states — small radius, cheap */
-  body.native .day.done{box-shadow:0 0 6px var(--cy-faint)!important}
-  body.native .mic.live .dot{box-shadow:0 0 5px var(--cy)!important}
-  body.native .navbtn.on{box-shadow:0 0 8px var(--cy-faint)!important}
-  body.native .sb.sel{box-shadow:0 0 6px currentColor!important}
+  /* What actually costs frames here is per-pixel work repeated across many
+     elements: large-radius box-shadows, backdrop blur, and custom clip-path
+     polygons. What's cheap is borders, flat fills, gradients, and transforms.
+     So rather than stripping the look, spend the budget where it reads:
+     a few large glows on hero elements, none on repeated list items. */
+
+  /* 1. Blur is the single most expensive effect — drop it everywhere and
+        compensate with a more opaque background so panels still separate. */
+  body.native .peek,body.native .vtoast,body.native .demobar,
+  body.native .alertbar,body.native .bootscreen{backdrop-filter:none!important}
+  body.native .vtoast,body.native .demobar{background:rgba(4,14,20,0.93)}
+  body.native .alertbar{background:rgba(30,6,10,0.95)}
+
+  /* 2. clip-path only where it repeats. The cut corner is the signature, so
+        it stays on the big single-instance frames and goes on list rows. */
+  body.native .day,body.native .habit,body.native .dl-row,
+  body.native .proj,body.native .sbtn{clip-path:none!important}
+  body.native .day{border-radius:7px}
+  body.native .habit,body.native .dl-row{border-radius:12px}
+  body.native .proj,body.native .sbtn{border-radius:14px}
+
+  /* 3. Kill glow on anything that repeats; keep it on the hero elements
+        where it carries the Stark look. */
+  body.native .meter i.on,body.native .proj .pbar i.on,
+  body.native .eq i,body.native .block.now .bbar{box-shadow:none!important}
+  body.native .proj:hover,body.native .sbtn:hover{box-shadow:none!important}
+  body.native .day.done{box-shadow:0 0 8px var(--cy-faint)!important}
+
+  /* 4. The core is the one thing worth spending on — it's a single element
+        and it's what the eye goes to. Full glow retained. */
+  body.native .core-btnring{box-shadow:inset 0 0 30px var(--cy-ghost)!important}
+  body.native .core-hit:hover ~ .core-btnring{
+    box-shadow:inset 0 0 42px var(--cy-faint),0 0 22px var(--cy-faint)!important}
+  body.native .core-hit:active ~ .core-btnring{
+    box-shadow:inset 0 0 60px var(--cy-faint),0 0 30px var(--cy-mid)!important}
+  body.native.listening .core-btnring{
+    box-shadow:inset 0 0 50px var(--cy-faint),0 0 26px var(--cy-mid)!important}
+
+  /* 5. Live-state accents: small radius, few elements, high signal. */
+  body.native .mic.live{box-shadow:0 0 12px var(--cy-faint)!important}
+  body.native .mic.live .dot{box-shadow:0 0 6px var(--cy)!important}
+  body.native .navbtn.on{box-shadow:0 0 10px var(--cy-faint)!important}
+  body.native .sb.sel{box-shadow:0 0 8px currentColor!important}
+  body.native .tile.flagged::after{box-shadow:0 0 14px var(--cy-faint)!important}
+
+  /* 6. Promote only the elements that actually animate, so the compositor
+        isn't juggling layers it doesn't need. */
+  body.native .core-glow,body.native .core-btnring,
+  body.native .spin1,body.native .spin2,body.native .spin3,body.native .spin4{
+    will-change:transform,opacity}
+  /* The starfield is 40 independently-animating nodes for very little payoff
+     at this size — the rotating rings already carry the ambience. */
+  body.native .star{display:none}
 </style>
 </head>
 <body data-state="blue">
